@@ -360,9 +360,29 @@ static int save_value_model(const char *path){
 
 关闭文件并检查关闭错误。成功返回 `1`。模型文件默认名为 `q_weights.dat`，路径相对于程序运行时的当前工作目录。
 
-### 2.9 核心训练函数 `train_value_model`（第 321–381 行）
+### 2.9 训练追踪表头 `write_training_trace_header`
 
-#### 超参数和随机数种子（第 322–323 行）
+训练函数可选接收一个 CSV 文件指针。启用追踪后，程序先写表头。前 15 列为：
+
+```text
+episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next_value,target,td_error,feature_norm
+```
+
+之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列，例如特征 0：
+
+| 列 | 含义 |
+| --- | --- |
+| `feature0` | 本次动作的特征值 `φ₀` |
+| `weight_before0` | 更新前权重 `w₀` |
+| `contribution0` | 该特征对当前估值的贡献 `w₀ × φ₀` |
+| `weight_delta0` | 本次权重变化 `Δw₀` |
+| `weight_after0` | 更新后权重 |
+
+特征 1 到 5 同样记录。由此可以区分权重变化是由较大的 TD 误差、该特征的取值，还是它们的乘积造成。每行对应一次训练更新。
+
+`shape` 是方块编号：0=I、1=T、2=O、3=J、4=L、5=S、6=Z。
+
+### 2.10 核心训练函数 `train_value_model`（第 332–430 行）
 
 ```c
 const double alpha=0.15,gamma=0.90;
@@ -373,7 +393,7 @@ srand((unsigned int)time(NULL));
 - `gamma` 是未来价值折扣率。程序用它折扣下一步的最大价值。
 - `srand` 使用当前时间初始化伪随机数生成器，用于随机方块与探索动作。由于种子只有秒级，短时间内连续启动训练可能得到相同随机序列。
 
-#### 开始每一局并清空棋盘（第 324–328 行）
+#### 开始每一局并清空棋盘（第 335–337 行）
 
 ```c
 for(int episode=0;episode<episodes;episode++){
@@ -384,7 +404,7 @@ for(int episode=0;episode<episodes;episode++){
 - 外层循环训练指定局数。
 - 每局开始时清空整个 `board[25][15]` 数组，保证上一局状态不会泄漏到新一局。
 
-#### 设置探索概率并抽取起始方块（第 329–332 行）
+#### 设置探索概率并抽取起始方块（第 338–340 行）
 
 ```c
 double epsilon=0.25-0.20*(double)episode/episodes;
@@ -396,7 +416,7 @@ int shape=rand()%7;
 - 最低值限制为 `0.05`，保留少量探索。
 - `rand()%7` 从 I、T、O、J、L、S、Z 七种方块中随机选择当前方块。
 
-#### 每局的最大步数（第 333 行）
+#### 每局的最大步数（第 341 行）
 
 ```c
 for(int turn=0;turn<1000;turn++){
@@ -404,7 +424,7 @@ for(int turn=0;turn<1000;turn++){
 
 每局最多训练 1000 次落子，避免单局无限运行。达到上限就结束本局并进入下一局。
 
-#### 获取可选动作和 epsilon-greedy 选择（第 334–346 行）
+#### 获取可选动作和 epsilon-greedy 选择（第 342–353 行）
 
 ```c
 training_action actions[40];
@@ -429,7 +449,7 @@ if((double)rand()/RAND_MAX<epsilon){
 - 否则扫描候选动作并选择价值最高的动作，进行利用。
 - 如果多个候选价值相同，保留先出现的候选。
 
-#### 执行动作和处理消行（第 347–357 行）
+#### 执行动作和处理消行（第 353–360 行）
 
 ```c
 training_action action=actions[selected];
@@ -461,7 +481,7 @@ int next_shape=rand()%7;
 
 初始化下一步价值为零，并随机产生下一个方块。这里假设方块独立、均匀随机出现。
 
-#### 估算后继动作价值（第 362–376 行）
+#### 估算后继动作价值（第 361–377 行）
 
 ```c
 if(!terminal){
@@ -493,7 +513,7 @@ if(!terminal){
 - 若没有可选的非顶出后继动作，额外扣除 `200`，将这种即将失败的局面视为不利状态。
 - 否则乘以折扣率 `gamma`，得到折扣后的下一状态价值。
 
-#### 计算 TD 误差并更新权重（第 378–386 行）
+#### 计算 TD 误差并更新权重（第 379–423 行）
 
 ```c
 double current_value=score_features(action.features);
@@ -513,10 +533,7 @@ for(int i=0;i<FEATURE_COUNT;i++)
 
 计算特征向量平方范数，并加 `1.0` 避免除零。归一化能降低特征数值较大时单次更新过猛的风险。
 
-```c
-for(int i=0;i<FEATURE_COUNT;i++)
-    value_weights[i]+=alpha*delta*action.features[i]/norm;
-```
+程序先计算候选新权重，再统一应用；追踪文件记录每维的更新前后值和变化量。若 TD 值或候选权重不是有限数，训练会报错退出，并且不会保存模型。
 
 逐个更新权重：
 
@@ -534,7 +551,7 @@ shape=next_shape;
 - 顶出时结束当前训练局。
 - 否则将下一个随机方块设为下一步当前方块，继续训练。
 
-### 2.10 训练命令入口 `main`（第 383 行以后）
+### 2.11 训练命令入口 `main`（第 432 行以后）
 
 ```c
 int main(int argc,char **argv){
@@ -569,13 +586,22 @@ if(argc>2){
 拒绝非整数、空参数、超出范围或解析溢出的输入。训练局数必须在 1 到 1,000,000 之间。
 
 ```c
+/* 主流程示意，省略了文件读写的错误处理分支。 */
 if(load_value_model("q_weights.dat")<0)return 1;
-train_value_model((int)episodes);
+const char *trace_path=argc==4?argv[3]:NULL;
+FILE *trace=NULL;
+if(trace_path){
+    trace=fopen(trace_path,"w");
+    if(!trace)return 1;
+    write_training_trace_header(trace);
+}
+if(!train_value_model((int)episodes,trace))return 1;
 if(!save_value_model("q_weights.dat"))return 1;
 ```
 
 - 先加载现有模型；不存在模型时继续使用初始权重，加载错误则退出。
-- 运行指定局数的训练。已有模型会在其权重基础上继续训练。
+- 可选地创建追踪 CSV，运行指定局数的训练。已有模型会在其权重基础上继续训练。
+- 每次更新会检查 TD 值和新权重是否为有限数；检测到数值异常时训练失败退出，不保存坏权重。
 - 训练完成后保存回 `q_weights.dat`；保存失败则以错误状态退出。
 
 ```c
@@ -607,7 +633,30 @@ gcc -std=c11 -O2 .\eluose.c -o .\eluose.exe
 .\eluose.exe --train 10000
 ```
 
+记录每一步特征与权重变化（例如训练 1000 局）：
+
+```powershell
+.\eluose.exe --train 1000 training_trace.csv
+```
+
+CSV 可用 Excel 导入，也可用 Python、R 等工具统计。重点比较 `featureN`、`weight_beforeN`、`contributionN`、`weight_deltaN` 和 `weight_afterN`，同时观察 `td_error` 与 `feature_norm`。例如，若某维 `weight_deltaN` 长期同号且绝对值持续增大，说明该维在持续推动权重漂移；若 `td_error` 很大而多维特征同时非零，需结合每维的 `weight_deltaN` 判断具体贡献。
+
+仓库中的 [`analyze_training.py`](./analyze_training.py) 可将追踪数据汇总并绘制训练得分、权重轨迹、每步权重变化和各特征量级。需要 Python 与 `matplotlib`：
+
+```powershell
+python -m pip install matplotlib
+python .\analyze_training.py .\training_trace.csv --output .\training_analysis.png
+```
+
 训练会在**当前工作目录**读取已有的 `q_weights.dat`（若存在）并保存训练后的模型。想从初始权重重新训练时，应先备份或移走旧模型文件。
+如果模型文件中已有 `nan`，程序会拒绝加载。先备份并移走该文件，再开始训练，例如：
+
+```powershell
+Move-Item .\q_weights.dat .\q_weights.nan.bak
+.\eluose.exe --train 1000 training_trace.csv
+```
+
+追踪文件应使用不同于 `q_weights.dat` 的文件名。
 
 正常模式下可从标准输入读取方块序列：
 

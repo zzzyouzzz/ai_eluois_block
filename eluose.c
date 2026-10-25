@@ -318,7 +318,18 @@ static int save_value_model(const char *path){
     return 1;
 }
 
-static void train_value_model(int episodes){
+static int write_training_trace_header(FILE *trace){
+    if(fprintf(trace,
+               "episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,"
+               "current_value,next_value,target,td_error,feature_norm")<0)return 0;
+    for(int i=0;i<FEATURE_COUNT;i++){
+        if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
+                   i,i,i,i,i)<0)return 0;
+    }
+    return fprintf(trace,"\n")>=0;
+}
+
+static int train_value_model(int episodes,FILE *trace){
     const double alpha=0.15,gamma=0.90;
     srand((unsigned int)time(NULL));
     for(int episode=0;episode<episodes;episode++){
@@ -371,18 +382,60 @@ static void train_value_model(int episodes){
             double norm=1.0;
             for(int i=0;i<FEATURE_COUNT;i++)
                 norm+=action.features[i]*action.features[i];
-            for(int i=0;i<FEATURE_COUNT;i++)
-                value_weights[i]+=alpha*delta*action.features[i]/norm;
+            if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
+               !isfinite(norm)){
+                fprintf(stderr,"训练数值异常：episode=%d turn=%d\n",episode+1,turn+1);
+                return 0;
+            }
+            double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
+            for(int i=0;i<FEATURE_COUNT;i++){
+                before[i]=value_weights[i];
+                updates[i]=alpha*delta*action.features[i]/norm;
+                after[i]=before[i]+updates[i];
+                if(!isfinite(after[i])){
+                    fprintf(stderr,"权重数值异常：episode=%d turn=%d feature=%d\n",
+                            episode+1,turn+1,i);
+                    return 0;
+                }
+            }
+            if(trace){
+                if(fprintf(trace,"%d,%d,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
+                                  "%.17g,%.17g,%.17g,%.17g,%.17g",
+                           episode+1,turn+1,shape,action.rotation,action.x,action.y,
+                           epsilon,score,reward,terminal,current_value,next_value,
+                           target,delta,norm)<0){
+                    fprintf(stderr,"写入训练追踪文件失败\n");
+                    return 0;
+                }
+                for(int i=0;i<FEATURE_COUNT;i++){
+                    if(fprintf(trace,",%.17g,%.17g,%.17g,%.17g,%.17g",
+                               action.features[i],before[i],
+                               before[i]*action.features[i],updates[i],after[i])<0){
+                        fprintf(stderr,"写入训练追踪文件失败\n");
+                        return 0;
+                    }
+                }
+                if(fprintf(trace,"\n")<0){
+                    fprintf(stderr,"写入训练追踪文件失败\n");
+                    return 0;
+                }
+            }
+            for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
 
             if(terminal)break;
             shape=next_shape;
         }
     }
+    return 1;
 }
 
 int main(int argc,char **argv){
     if(argc>1&&strcmp(argv[1],"--train")==0){
         long episodes=2000;
+        if(argc>4){
+            fprintf(stderr,"用法：%s --train [episodes] [trace.csv]\n",argv[0]);
+            return 1;
+        }
         if(argc>2){
             char *end=NULL;
             errno=0;
@@ -392,8 +445,33 @@ int main(int argc,char **argv){
                 return 1;
             }
         }
+        const char *trace_path=argc==4?argv[3]:NULL;
+        if(trace_path&&strcmp(trace_path,"q_weights.dat")==0){
+            fprintf(stderr,"追踪文件不能覆盖 q_weights.dat\n");
+            return 1;
+        }
         if(load_value_model("q_weights.dat")<0)return 1;
-        train_value_model((int)episodes);
+        FILE *trace=NULL;
+        if(trace_path){
+            trace=fopen(trace_path,"w");
+            if(!trace){
+                fprintf(stderr,"无法创建训练追踪文件 %s\n",trace_path);
+                return 1;
+            }
+            if(!write_training_trace_header(trace)){
+                fprintf(stderr,"无法写入训练追踪文件表头 %s\n",trace_path);
+                fclose(trace);
+                return 1;
+            }
+        }
+        if(!train_value_model((int)episodes,trace)){
+            if(trace)fclose(trace);
+            return 1;
+        }
+        if(trace&&fclose(trace)!=0){
+            fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
+            return 1;
+        }
         if(!save_value_model("q_weights.dat"))return 1;
         printf("训练完成：%ld 局，模型已保存到 q_weights.dat\n",episodes);
         for(int i=0;i<FEATURE_COUNT;i++)
