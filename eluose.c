@@ -132,7 +132,8 @@ void clear_lines(const int full_rows[4],int fill_line){
     }
     while(write_row<20){
         for(int column=0;column<10;column++)
-            board[write_row++][column]=0;
+            board[write_row][column]=0;
+        write_row++;
     }
 }
 
@@ -399,10 +400,7 @@ int main(int argc,char **argv){
             printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
         return 0;
     }
-    if(argc>1){
-        fprintf(stderr,"用法：%s [--train [episodes]]\n",argv[0]);
-        return 1;
-    }
+    
     if(load_value_model("q_weights.dat")<0)return 1;
     clock_t start = clock();
     int score=0;
