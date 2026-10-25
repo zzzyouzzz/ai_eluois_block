@@ -329,7 +329,7 @@ static int write_training_trace_header(FILE *trace){
     return fprintf(trace,"\n")>=0;
 }
 
-static int record_training_data(FILE *trace,int episode,int turn,int shape,
+static int record_training_data(FILE *trace,int episode,unsigned long long turn,int shape,
                                 const training_action *action,double epsilon,
                                 int score,double reward,int terminal,
                                 double current_value,double next_value,
@@ -338,7 +338,7 @@ static int record_training_data(FILE *trace,int episode,int turn,int shape,
                                 const double updates[FEATURE_COUNT],
                                 const double after[FEATURE_COUNT]){
     if(!trace)return 1;
-    if(fprintf(trace,"%d,%d,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
+    if(fprintf(trace,"%d,%llu,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
                      "%.17g,%.17g,%.17g,%.17g,%.17g",
                episode,turn,shape,action->rotation,action->x,action->y,
                epsilon,score,reward,terminal,current_value,next_value,
@@ -361,105 +361,126 @@ static int record_training_data(FILE *trace,int episode,int turn,int shape,
     return 1;
 }
 
-static int train_value_model(int episodes,FILE *block_input,FILE *trace,
+static int train_value_episode(FILE *block_input,FILE *trace,int episode,
+                               double epsilon,int *has_training_data){
+    const double alpha=0.001,gamma=0.90;
+    for(int i=0;i<25;i++)
+        for(int j=0;j<15;j++)board[i][j]=0;
+    *has_training_data=0;
+    int shape=get_block(block_input);
+    if(shape<0||shape==7)return 1;
+
+    for(unsigned long long turn=1;;turn++){
+        training_action actions[40];
+        int count=collect_actions(shape,actions);
+        if(count==0)return 1;
+
+        int selected=0;
+        if((double)rand()/RAND_MAX<epsilon){
+            selected=rand()%count;
+        }else{
+            for(int i=1;i<count;i++)
+                if(actions[i].value>actions[selected].value)selected=i;
+        }
+        training_action action=actions[selected];
+        int fill[4],full_rows[4],fill_line;
+        int score=place_block(shape,action.rotation,action.x,action.y,
+                              fill,full_rows,&fill_line);
+        if(score<0)break;
+        clear_lines(full_rows,fill_line);
+
+        int terminal=action.top_out;
+        double reward=0.34*score-(action.top_out?200.0:0.0);
+        double next_value=0.0;
+        int next_shape=-1;
+        int end_of_input=0;
+        if(!terminal){
+            next_shape=get_block(block_input);
+            if(next_shape<0||next_shape==7){
+                terminal=1;
+                end_of_input=1;
+            }else{
+                training_action next_actions[40];
+                int next_count=collect_actions(next_shape,next_actions);
+                int has_next_action=0;
+                for(int i=0;i<next_count;i++){
+                    if(!next_actions[i].top_out&&
+                       (!has_next_action||next_actions[i].value>next_value)){
+                        next_value=next_actions[i].value;
+                        has_next_action=1;
+                    }
+                }
+                if(!has_next_action){
+                    reward-=200.0;
+                    terminal=1;
+                }else{
+                    next_value=gamma*next_value;
+                }
+            }
+        }
+
+        double current_value=score_features(action.features);
+        double target=reward+((action.top_out||end_of_input)?0.0:next_value);
+        double delta=target-current_value;
+        double norm=1.0;
+        for(int i=0;i<FEATURE_COUNT;i++)
+            norm+=action.features[i]*action.features[i];
+        if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
+           !isfinite(norm)){
+            fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",episode,turn);
+            return 0;
+        }
+        double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
+        for(int i=0;i<FEATURE_COUNT;i++){
+            before[i]=value_weights[i];
+            updates[i]=alpha*delta*action.features[i]/norm;
+            after[i]=before[i]+updates[i];
+            if(!isfinite(after[i])){
+                fprintf(stderr,
+                        "权重数值异常：episode=%d turn=%llu feature=%d\n",
+                        episode,turn,i);
+                return 0;
+            }
+        }
+        if(!record_training_data(trace,episode,turn,shape,&action,
+                                 epsilon,score,reward,terminal,current_value,
+                                 next_value,target,delta,norm,before,updates,after))
+            return 0;
+        for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
+
+        *has_training_data=1;
+        if(terminal)break;
+        shape=next_shape;
+    }
+    return 1;
+}
+
+static int train_value_model(int episodes,const char *input_path,FILE *trace,
                              int *completed_episodes){
-    const double alpha=0.15,gamma=0.90;
     srand((unsigned int)time(NULL));
     *completed_episodes=0;
     for(int episode=0;episode<episodes;episode++){
-        for(int i=0;i<25;i++)
-            for(int j=0;j<15;j++)board[i][j]=0;
+        FILE *block_input=stdin;
+        if(input_path&&strcmp(input_path,"-")!=0){
+            block_input=fopen(input_path,"r");
+            if(!block_input){
+                fprintf(stderr,"无法打开训练输入文件 %s\n",input_path);
+                return 0;
+            }
+        }
+
         double epsilon=0.25-0.20*(double)episode/episodes;
         if(epsilon<0.05)epsilon=0.05;
-        int shape=get_block(block_input);
-        if(shape<0||shape==7)break;
-        int turns=0;
-        int stop_training=0;
-        for(int turn=0;turn<1000;turn++){
-            training_action actions[40];
-            int count=collect_actions(shape,actions);
-            if(count==0)break;
-
-            int selected=0;
-            if((double)rand()/RAND_MAX<epsilon){
-                selected=rand()%count;
-            }else{
-                for(int i=1;i<count;i++)
-                    if(actions[i].value>actions[selected].value)selected=i;
-            }
-            training_action action=actions[selected];
-            int fill[4],full_rows[4],fill_line;
-            int score=place_block(shape,action.rotation,action.x,action.y,
-                                  fill,full_rows,&fill_line);
-            if(score<0)break;
-            clear_lines(full_rows,fill_line);
-            int terminal=action.top_out;
-            double reward=0.34*score-(action.top_out?200.0:0.0);
-            double next_value=0.0;
-            int next_shape=-1;
-            int end_of_input=0;
-            if(!terminal&&turn<999){
-                next_shape=get_block(block_input);
-                if(next_shape<0||next_shape==7){
-                    terminal=1;
-                    end_of_input=1;
-                    stop_training=1;
-                }else{
-                    training_action next_actions[40];
-                    int next_count=collect_actions(next_shape,next_actions);
-                    int has_next_action=0;
-                    for(int i=0;i<next_count;i++){
-                        if(!next_actions[i].top_out&&
-                           (!has_next_action||next_actions[i].value>next_value)){
-                            next_value=next_actions[i].value;
-                            has_next_action=1;
-                        }
-                    }
-                    if(!has_next_action){
-                        reward-=200.0;
-                        terminal=1;
-                    }else{
-                        next_value=gamma*next_value;
-                    }
-                }
-            }else if(!terminal){
-                terminal=1;
-            }
-
-            double current_value=score_features(action.features);
-            double target=reward+((action.top_out||end_of_input)?0.0:next_value);
-            double delta=target-current_value;
-            double norm=1.0;
-            for(int i=0;i<FEATURE_COUNT;i++)
-                norm+=action.features[i]*action.features[i];
-            if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
-               !isfinite(norm)){
-                fprintf(stderr,"训练数值异常：episode=%d turn=%d\n",episode+1,turn+1);
-                return 0;
-            }
-            double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
-            for(int i=0;i<FEATURE_COUNT;i++){
-                before[i]=value_weights[i];
-                updates[i]=alpha*delta*action.features[i]/norm;
-                after[i]=before[i]+updates[i];
-                if(!isfinite(after[i])){
-                    fprintf(stderr,"权重数值异常：episode=%d turn=%d feature=%d\n",
-                            episode+1,turn+1,i);
-                    return 0;
-                }
-            }
-            if(!record_training_data(trace,episode+1,turn+1,shape,&action,
-                                     epsilon,score,reward,terminal,current_value,
-                                     next_value,target,delta,norm,before,updates,after))
-                return 0;
-            for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
-
-            turns++;
-            if(terminal)break;
-            shape=next_shape;
+        int has_training_data=0;
+        int success=train_value_episode(block_input,trace,episode+1,epsilon,
+                                        &has_training_data);
+        if(block_input!=stdin&&fclose(block_input)!=0){
+            fprintf(stderr,"关闭训练输入文件失败：%s\n",input_path);
+            return 0;
         }
-        if(turns>0)(*completed_episodes)++;
-        if(stop_training)break;
+        if(!success)return 0;
+        if(!has_training_data)break;
+        (*completed_episodes)++;
     }
     return 1;
 }
@@ -557,9 +578,14 @@ int main(int argc,char **argv){
         fprintf(stderr,"追踪文件不能覆盖 q_weights.dat\n");
         return 1;
     }
+    if(training&&episodes>1&&
+       (!input_path||strcmp(input_path,"-")==0)){
+        fprintf(stderr,"多轮训练必须使用 -i 指定可重复读取的输入文件\n");
+        return 1;
+    }
 
     FILE *input=stdin;
-    if(input_path&&strcmp(input_path,"-")!=0){
+    if(!training&&input_path&&strcmp(input_path,"-")!=0){
         input=fopen(input_path,"r");
         if(!input){
             fprintf(stderr,"无法打开方块输入文件 %s\n",input_path);
@@ -577,29 +603,21 @@ int main(int argc,char **argv){
             trace=fopen(trace_path,"w");
             if(!trace){
                 fprintf(stderr,"无法创建训练追踪文件 %s\n",trace_path);
-                if(input!=stdin)fclose(input);
                 return 1;
             }
             if(!write_training_trace_header(trace)){
                 fprintf(stderr,"无法写入训练追踪文件表头 %s\n",trace_path);
                 fclose(trace);
-                if(input!=stdin)fclose(input);
                 return 1;
             }
         }
         int completed_episodes=0;
-        if(!train_value_model((int)episodes,input,trace,&completed_episodes)){
+        if(!train_value_model((int)episodes,input_path,trace,&completed_episodes)){
             if(trace)fclose(trace);
-            if(input!=stdin)fclose(input);
             return 1;
         }
         if(trace&&fclose(trace)!=0){
             fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
-            if(input!=stdin)fclose(input);
-            return 1;
-        }
-        if(input!=stdin&&fclose(input)!=0){
-            fprintf(stderr,"关闭方块输入文件失败：%s\n",input_path);
             return 1;
         }
         if(completed_episodes==0){

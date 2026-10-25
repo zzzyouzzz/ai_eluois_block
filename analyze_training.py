@@ -14,7 +14,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Visualize episode returns and feature/weight changes from a training trace."
     )
-    parser.add_argument("trace", nargs="?", default="training_trace_1000.csv")
+    parser.add_argument("trace", nargs="?", default="training_trace.csv")
     parser.add_argument(
         "--output", default="training_analysis_1000.png", help="Output image path."
     )
