@@ -329,15 +329,52 @@ static int write_training_trace_header(FILE *trace){
     return fprintf(trace,"\n")>=0;
 }
 
-static int train_value_model(int episodes,FILE *trace){
+static int record_training_data(FILE *trace,int episode,int turn,int shape,
+                                const training_action *action,double epsilon,
+                                int score,double reward,int terminal,
+                                double current_value,double next_value,
+                                double target,double delta,double norm,
+                                const double before[FEATURE_COUNT],
+                                const double updates[FEATURE_COUNT],
+                                const double after[FEATURE_COUNT]){
+    if(!trace)return 1;
+    if(fprintf(trace,"%d,%d,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
+                     "%.17g,%.17g,%.17g,%.17g,%.17g",
+               episode,turn,shape,action->rotation,action->x,action->y,
+               epsilon,score,reward,terminal,current_value,next_value,
+               target,delta,norm)<0){
+        fprintf(stderr,"写入训练追踪文件失败\n");
+        return 0;
+    }
+    for(int i=0;i<FEATURE_COUNT;i++){
+        if(fprintf(trace,",%.17g,%.17g,%.17g,%.17g,%.17g",
+                   action->features[i],before[i],
+                   before[i]*action->features[i],updates[i],after[i])<0){
+            fprintf(stderr,"写入训练追踪文件失败\n");
+            return 0;
+        }
+    }
+    if(fprintf(trace,"\n")<0){
+        fprintf(stderr,"写入训练追踪文件失败\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int train_value_model(int episodes,FILE *block_input,FILE *trace,
+                             int *completed_episodes){
     const double alpha=0.15,gamma=0.90;
     srand((unsigned int)time(NULL));
+    *completed_episodes=0;
     for(int episode=0;episode<episodes;episode++){
         for(int i=0;i<25;i++)
             for(int j=0;j<15;j++)board[i][j]=0;
         double epsilon=0.25-0.20*(double)episode/episodes;
         if(epsilon<0.05)epsilon=0.05;
-        int shape=rand()%7;
+        int shape=get_block(block_input);
+        if(shape<0||shape==7)break;
+        int turns=0;
+        int stop_training=0;
         for(int turn=0;turn<1000;turn++){
             training_action actions[40];
             int count=collect_actions(shape,actions);
@@ -357,27 +394,40 @@ static int train_value_model(int episodes,FILE *trace){
             if(score<0)break;
             clear_lines(full_rows,fill_line);
             int terminal=action.top_out;
-            double reward=0.34*score-(terminal?200.0:0.0);
+            double reward=0.34*score-(action.top_out?200.0:0.0);
             double next_value=0.0;
-            int next_shape=rand()%7;
-
-            if(!terminal){
-                training_action next_actions[40];
-                int next_count=collect_actions(next_shape,next_actions);
-                int has_next_action=0;
-                for(int i=0;i<next_count;i++){
-                    if(!next_actions[i].top_out&&
-                       (!has_next_action||next_actions[i].value>next_value)){
-                        next_value=next_actions[i].value;
-                        has_next_action=1;
+            int next_shape=-1;
+            int end_of_input=0;
+            if(!terminal&&turn<999){
+                next_shape=get_block(block_input);
+                if(next_shape<0||next_shape==7){
+                    terminal=1;
+                    end_of_input=1;
+                    stop_training=1;
+                }else{
+                    training_action next_actions[40];
+                    int next_count=collect_actions(next_shape,next_actions);
+                    int has_next_action=0;
+                    for(int i=0;i<next_count;i++){
+                        if(!next_actions[i].top_out&&
+                           (!has_next_action||next_actions[i].value>next_value)){
+                            next_value=next_actions[i].value;
+                            has_next_action=1;
+                        }
+                    }
+                    if(!has_next_action){
+                        reward-=200.0;
+                        terminal=1;
+                    }else{
+                        next_value=gamma*next_value;
                     }
                 }
-                if(!has_next_action)reward-=200.0;
-                else next_value=gamma*next_value;
+            }else if(!terminal){
+                terminal=1;
             }
 
             double current_value=score_features(action.features);
-            double target=reward+(terminal?0.0:next_value);
+            double target=reward+((action.top_out||end_of_input)?0.0:next_value);
             double delta=target-current_value;
             double norm=1.0;
             for(int i=0;i<FEATURE_COUNT;i++)
@@ -398,102 +448,29 @@ static int train_value_model(int episodes,FILE *trace){
                     return 0;
                 }
             }
-            if(trace){
-                if(fprintf(trace,"%d,%d,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
-                                  "%.17g,%.17g,%.17g,%.17g,%.17g",
-                           episode+1,turn+1,shape,action.rotation,action.x,action.y,
-                           epsilon,score,reward,terminal,current_value,next_value,
-                           target,delta,norm)<0){
-                    fprintf(stderr,"写入训练追踪文件失败\n");
-                    return 0;
-                }
-                for(int i=0;i<FEATURE_COUNT;i++){
-                    if(fprintf(trace,",%.17g,%.17g,%.17g,%.17g,%.17g",
-                               action.features[i],before[i],
-                               before[i]*action.features[i],updates[i],after[i])<0){
-                        fprintf(stderr,"写入训练追踪文件失败\n");
-                        return 0;
-                    }
-                }
-                if(fprintf(trace,"\n")<0){
-                    fprintf(stderr,"写入训练追踪文件失败\n");
-                    return 0;
-                }
-            }
+            if(!record_training_data(trace,episode+1,turn+1,shape,&action,
+                                     epsilon,score,reward,terminal,current_value,
+                                     next_value,target,delta,norm,before,updates,after))
+                return 0;
             for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
 
+            turns++;
             if(terminal)break;
             shape=next_shape;
         }
+        if(turns>0)(*completed_episodes)++;
+        if(stop_training)break;
     }
     return 1;
 }
 
-int main(int argc,char **argv){
-    if(argc>1&&strcmp(argv[1],"--train")==0){
-        long episodes=2000;
-        if(argc>4){
-            fprintf(stderr,"用法：%s --train [episodes] [trace.csv]\n",argv[0]);
-            return 1;
-        }
-        if(argc>2){
-            char *end=NULL;
-            errno=0;
-            episodes=strtol(argv[2],&end,10);
-            if(errno||end==argv[2]||*end!='\0'||episodes<1||episodes>1000000){
-                fprintf(stderr,"用法：%s --train [episodes]\n",argv[0]);
-                return 1;
-            }
-        }
-        const char *trace_path=argc==4?argv[3]:NULL;
-        if(trace_path&&strcmp(trace_path,"q_weights.dat")==0){
-            fprintf(stderr,"追踪文件不能覆盖 q_weights.dat\n");
-            return 1;
-        }
-        if(load_value_model("q_weights.dat")<0)return 1;
-        FILE *trace=NULL;
-        if(trace_path){
-            trace=fopen(trace_path,"w");
-            if(!trace){
-                fprintf(stderr,"无法创建训练追踪文件 %s\n",trace_path);
-                return 1;
-            }
-            if(!write_training_trace_header(trace)){
-                fprintf(stderr,"无法写入训练追踪文件表头 %s\n",trace_path);
-                fclose(trace);
-                return 1;
-            }
-        }
-        if(!train_value_model((int)episodes,trace)){
-            if(trace)fclose(trace);
-            return 1;
-        }
-        if(trace&&fclose(trace)!=0){
-            fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
-            return 1;
-        }
-        if(!save_value_model("q_weights.dat"))return 1;
-        printf("训练完成：%ld 局，模型已保存到 q_weights.dat\n",episodes);
-        for(int i=0;i<FEATURE_COUNT;i++)
-            printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
-        return 0;
-    }
-    
-    if(load_value_model("q_weights.dat")<0)return 1;
-    clock_t start = clock();
+static int run_game(FILE *input){
+    clock_t start=clock();
     int score=0;
-    int current_block=-1,next_block=-1;
-    FILE *fp = stdin;
-    if(argc>1){
-        fp = fopen(argv[1], "r");
-        if(!fp){
-            fprintf(stderr,"无法打开方块序列文件 3.txt\n");
-            return 1;
-        }
-    }
-    current_block=get_block(fp);
-    next_block=get_block(fp);
-    while(current_block!=-1){
+    int current_block=get_block(input);
+    int next_block=get_block(input);
+
+    while(current_block>=0&&current_block<7){
         int rotation=0,x=0,y=16;
         find_best_position(current_block,&rotation,&x,&y);
         int fill[4],full_rows[4],fill_line;
@@ -501,47 +478,146 @@ int main(int argc,char **argv){
                                     fill,full_rows,&fill_line);
         if(block_score<0){
             fprintf(stderr,"无法放置方块\n");
-            fclose(fp);
             return 1;
         }
         score+=block_score;
         clear_lines(full_rows,fill_line);
-        
-        /*for(int i=19;i>=0;i--){
-            for(int j=0;j<10;j++){
-                printf("%c"," O"[board[i][j]]); 
-            }printf("\n");
-        }*/
+
         printf("%d %d\n%d\n",rotation,x,score);
         fflush(stdout);
 
         if(y+block_h[current_block][rotation]>14){
-            printf("You lose!\n") ;
-            for(int i=19;i>=0;i--){
-                for(int j=0;j<10;j++){
-                    printf("%c"," O"[board[i][j]]); 
-                }printf("\n");
+            printf("You lose!\n");
+            for(int row=19;row>=0;row--){
+                for(int column=0;column<10;column++)
+                    printf("%c"," O"[board[row][column]]);
+                printf("\n");
             }
             break;
         }
-        //下一个方块
-        
-        if(next_block!=-1){
-            current_block=next_block;
-            next_block=get_block(fp);
-            
-            if(next_block==7){
-                break;
-            }
-            if(next_block==-666){
-                break; 
-            }
-        }else{
-            current_block=next_block;
-        }
 
+        if(next_block==-1||next_block==7||next_block==-666)break;
+        current_block=next_block;
+        next_block=get_block(input);
     }
-    fclose(fp);
-    printf("耗时：%d ms\n", clock()-start);
+    printf("耗时：%d ms\n",clock()-start);
     return 0;
+}
+
+int main(int argc,char **argv){
+    long episodes=2000;
+    int training=0;
+    const char *input_path=NULL;
+    const char *trace_path=NULL;
+    for(int i=1;i<argc;i++){
+        if(strcmp(argv[i],"--train")==0){
+            if(training){
+                fprintf(stderr,"训练模式参数重复\n");
+                return 1;
+            }
+            training=1;
+            if(i+1<argc&&argv[i+1][0]!='-'){
+                char *end=NULL;
+                errno=0;
+                long parsed=strtol(argv[i+1],&end,10);
+                if(end!=argv[i+1]&&*end=='\0'){
+                    if(errno||parsed<1||parsed>1000000){
+                        fprintf(stderr,"训练局数必须是 1 到 1000000 之间的整数\n");
+                        return 1;
+                    }
+                    episodes=parsed;
+                    i++;
+                }
+            }
+        }else if(strcmp(argv[i],"-i")==0){
+            if(input_path||i+1>=argc||argv[i+1][0]=='\0'||
+               (argv[i+1][0]=='-'&&strcmp(argv[i+1],"-")!=0)){
+                fprintf(stderr,"-i 后必须指定输入文件，且只能指定一次\n");
+                return 1;
+            }
+            input_path=argv[++i];
+        }else if(strcmp(argv[i],"--trace")==0){
+            if(trace_path||i+1>=argc||argv[i+1][0]=='\0'){
+                fprintf(stderr,"--trace 后必须指定追踪文件，且只能指定一次\n");
+                return 1;
+            }
+            trace_path=argv[++i];
+        }else{
+            fprintf(stderr,
+                    "用法：%s [--train [局数]] [-i 方块输入文件] [--trace 追踪文件]\n",
+                    argv[0]);
+            return 1;
+        }
+    }
+    if(trace_path&&!training){
+        fprintf(stderr,"--trace 只能与 --train 一起使用\n");
+        return 1;
+    }
+    if(trace_path&&strcmp(trace_path,"q_weights.dat")==0){
+        fprintf(stderr,"追踪文件不能覆盖 q_weights.dat\n");
+        return 1;
+    }
+
+    FILE *input=stdin;
+    if(input_path&&strcmp(input_path,"-")!=0){
+        input=fopen(input_path,"r");
+        if(!input){
+            fprintf(stderr,"无法打开方块输入文件 %s\n",input_path);
+            return 1;
+        }
+    }
+    if(load_value_model("q_weights.dat")<0){
+        if(input!=stdin)fclose(input);
+        return 1;
+    }
+
+    if(training){
+        FILE *trace=NULL;
+        if(trace_path){
+            trace=fopen(trace_path,"w");
+            if(!trace){
+                fprintf(stderr,"无法创建训练追踪文件 %s\n",trace_path);
+                if(input!=stdin)fclose(input);
+                return 1;
+            }
+            if(!write_training_trace_header(trace)){
+                fprintf(stderr,"无法写入训练追踪文件表头 %s\n",trace_path);
+                fclose(trace);
+                if(input!=stdin)fclose(input);
+                return 1;
+            }
+        }
+        int completed_episodes=0;
+        if(!train_value_model((int)episodes,input,trace,&completed_episodes)){
+            if(trace)fclose(trace);
+            if(input!=stdin)fclose(input);
+            return 1;
+        }
+        if(trace&&fclose(trace)!=0){
+            fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
+            if(input!=stdin)fclose(input);
+            return 1;
+        }
+        if(input!=stdin&&fclose(input)!=0){
+            fprintf(stderr,"关闭方块输入文件失败：%s\n",input_path);
+            return 1;
+        }
+        if(completed_episodes==0){
+            fprintf(stderr,"训练输入中没有可用方块\n");
+            return 1;
+        }
+        if(!save_value_model("q_weights.dat"))return 1;
+        printf("训练完成：%d 局，模型已保存到 q_weights.dat\n",
+               completed_episodes);
+        for(int i=0;i<FEATURE_COUNT;i++)
+            printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
+        return 0;
+    }
+
+    int result=run_game(input);
+    if(input!=stdin&&fclose(input)!=0){
+        fprintf(stderr,"关闭方块输入文件失败：%s\n",input_path);
+        return 1;
+    }
+    return result;
 }

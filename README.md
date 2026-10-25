@@ -368,7 +368,7 @@ static int save_value_model(const char *path){
 episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next_value,target,td_error,feature_norm
 ```
 
-之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列，例如特征 0：
+之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列，例如特征 0。`record_training_data` 独立负责写入一条完整更新记录；不启用追踪时不会写 CSV：
 
 | 列 | 含义 |
 | --- | --- |
@@ -382,7 +382,7 @@ episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next
 
 `shape` 是方块编号：0=I、1=T、2=O、3=J、4=L、5=S、6=Z。
 
-### 2.10 核心训练函数 `train_value_model`（第 332–430 行）
+### 2.10 核心训练函数 `train_value_model`
 
 ```c
 const double alpha=0.15,gamma=0.90;
@@ -391,7 +391,7 @@ srand((unsigned int)time(NULL));
 
 - `alpha` 是学习率，控制每次权重更新的幅度。较大时学习快但可能不稳定，较小时更新平缓。
 - `gamma` 是未来价值折扣率。程序用它折扣下一步的最大价值。
-- `srand` 使用当前时间初始化伪随机数生成器，用于随机方块与探索动作。由于种子只有秒级，短时间内连续启动训练可能得到相同随机序列。
+- `srand` 使用当前时间初始化伪随机数生成器，用于 epsilon-greedy 动作探索。训练方块不再随机生成，而是按输入序列调用 `get_block` 读取。
 
 #### 开始每一局并清空棋盘（第 335–337 行）
 
@@ -404,17 +404,18 @@ for(int episode=0;episode<episodes;episode++){
 - 外层循环训练指定局数。
 - 每局开始时清空整个 `board[25][15]` 数组，保证上一局状态不会泄漏到新一局。
 
-#### 设置探索概率并抽取起始方块（第 338–340 行）
+#### 设置探索概率并读取起始方块
 
 ```c
 double epsilon=0.25-0.20*(double)episode/episodes;
 if(epsilon<0.05)epsilon=0.05;
-int shape=rand()%7;
+int shape=get_block(block_input);
 ```
 
 - `epsilon` 从约 `0.25` 随训练进度线性下降到 `0.05`。
 - 最低值限制为 `0.05`，保留少量探索。
-- `rand()%7` 从 I、T、O、J、L、S、Z 七种方块中随机选择当前方块。
+- `get_block` 从训练输入流按原顺序读取方块。棋盘顶出后开始下一局，并继续消费同一输入流。
+- 输入结束、遇到 `E` 或 `X` 时停止训练；不足请求局数时按实际完成局数报告。
 
 #### 每局的最大步数（第 341 行）
 
@@ -476,10 +477,10 @@ double reward=0.34*score-(terminal?200.0:0.0);
 
 ```c
 double next_value=0.0;
-int next_shape=rand()%7;
+int next_shape=get_block(block_input);
 ```
 
-初始化下一步价值为零，并随机产生下一个方块。这里假设方块独立、均匀随机出现。
+初始化下一步价值为零，并通过 `get_block(block_input)` 读取序列中的下一个方块。
 
 #### 估算后继动作价值（第 361–377 行）
 
@@ -490,7 +491,7 @@ if(!terminal){
     int has_next_action=0;
 ```
 
-非终局时，根据刚更新过的棋盘和随机生成的下一个方块枚举后继动作。`has_next_action` 用来区分“最大价值确实为 0”和“没有任何非顶出动作”。
+非终局且输入仍有方块时，根据刚更新过的棋盘和输入序列中的下一个方块枚举后继动作。`has_next_action` 用来区分“最大价值确实为 0”和“没有任何非顶出动作”。
 
 ```c
     for(int i=0;i<next_count;i++){
@@ -549,69 +550,18 @@ shape=next_shape;
 ```
 
 - 顶出时结束当前训练局。
-- 否则将下一个随机方块设为下一步当前方块，继续训练。
+- 否则将输入序列中的下一个方块设为下一步当前方块，继续训练。
 
-### 2.11 训练命令入口 `main`（第 432 行以后）
+### 2.11 命令行参数
 
-```c
-int main(int argc,char **argv){
-    if(argc>1&&strcmp(argv[1],"--train")==0){
-```
+`main` 统一解析运行模式和输入源：
 
-如果第一个命令行参数是 `--train`，程序进入训练模式。
+- `--train [局数]` 启用训练；局数可省略（默认 2000），范围为 1 到 1,000,000。
+- `-i 方块输入文件` 在训练和正常运行模式中指定方块序列；省略时使用 `stdin`，`-i -` 也表示 `stdin`。
+- `--trace CSV文件` 可选，仅用于训练模式，记录每步训练数据。
+- 参数顺序不限，例如 `eluose.exe -i .\1.txt --train 1000` 与 `eluose.exe --train 1000 -i .\1.txt` 等价。
 
-```c
-long episodes=2000;
-```
-
-未指定局数时默认训练 2000 局。
-
-```c
-if(argc>2){
-    char *end=NULL;
-    errno=0;
-    episodes=strtol(argv[2],&end,10);
-```
-
-若提供局数，则用 `strtol` 解析十进制整数，并通过 `end` 和 `errno` 检查解析结果。
-
-```c
-    if(errno||end==argv[2]||*end!='\0'||episodes<1||episodes>1000000){
-        fprintf(stderr,"用法：%s --train [episodes]\n",argv[0]);
-        return 1;
-    }
-}
-```
-
-拒绝非整数、空参数、超出范围或解析溢出的输入。训练局数必须在 1 到 1,000,000 之间。
-
-```c
-/* 主流程示意，省略了文件读写的错误处理分支。 */
-if(load_value_model("q_weights.dat")<0)return 1;
-const char *trace_path=argc==4?argv[3]:NULL;
-FILE *trace=NULL;
-if(trace_path){
-    trace=fopen(trace_path,"w");
-    if(!trace)return 1;
-    write_training_trace_header(trace);
-}
-if(!train_value_model((int)episodes,trace))return 1;
-if(!save_value_model("q_weights.dat"))return 1;
-```
-
-- 先加载现有模型；不存在模型时继续使用初始权重，加载错误则退出。
-- 可选地创建追踪 CSV，运行指定局数的训练。已有模型会在其权重基础上继续训练。
-- 每次更新会检查 TD 值和新权重是否为有限数；检测到数值异常时训练失败退出，不保存坏权重。
-- 训练完成后保存回 `q_weights.dat`；保存失败则以错误状态退出。
-
-```c
-printf("训练完成：%ld 局，模型已保存到 q_weights.dat\n",episodes);
-for(int i=0;i<FEATURE_COUNT;i++)
-    printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
-return 0;
-```
-
-输出训练局数和 6 个新权重，便于查看训练结果，然后正常结束程序。
+训练会加载已有 `q_weights.dat`（不存在则使用源码默认权重），按输入序列训练，并保存更新后的权重。EOF、`E` 或 `X` 会结束输入；实际完成局数可能小于指定上限。
 
 ## 3. 编译和运行
 
@@ -621,23 +571,25 @@ return 0;
 gcc -std=c11 -O2 .\eluose.c -o .\eluose.exe
 ```
 
-训练默认 2000 局：
+训练模式默认最多重复 2000 局，从标准输入读取方块序列：
 
 ```powershell
-.\eluose.exe --train
+Get-Content .\1.txt | .\eluose.exe --train
 ```
 
 指定训练局数，例如 10000 局：
 
 ```powershell
-.\eluose.exe --train 10000
+.\eluose.exe --train 10000 -i .\1.txt
 ```
 
-记录每一步特征与权重变化（例如训练 1000 局）：
+记录每一步特征与权重变化（例如最多训练 1000 局）：
 
 ```powershell
-.\eluose.exe --train 1000 training_trace.csv
+.\eluose.exe --train 1000 --trace .\training_trace.csv -i .\1.txt
 ```
+
+训练依次使用输入中的方块；棋盘顶出时进入下一局并继续读取后续方块。遇到 EOF、`E` 或 `X` 时停止，因此实际完成局数可能少于指定上限。动作探索仍使用 epsilon-greedy 随机策略。`-i` 可用于指定训练或正常模式的输入文件；省略时默认使用 `stdin`，传入 `-i -` 也表示 `stdin`。
 
 CSV 可用 Excel 导入，也可用 Python、R 等工具统计。重点比较 `featureN`、`weight_beforeN`、`contributionN`、`weight_deltaN` 和 `weight_afterN`，同时观察 `td_error` 与 `feature_norm`。例如，若某维 `weight_deltaN` 长期同号且绝对值持续增大，说明该维在持续推动权重漂移；若 `td_error` 很大而多维特征同时非零，需结合每维的 `weight_deltaN` 判断具体贡献。
 
@@ -653,30 +605,25 @@ python .\analyze_training.py .\training_trace.csv --output .\training_analysis.p
 
 ```powershell
 Move-Item .\q_weights.dat .\q_weights.nan.bak
-.\eluose.exe --train 1000 training_trace.csv
+.\eluose.exe --train 1000 -i .\1.txt --trace .\training_trace.csv
 ```
 
 追踪文件应使用不同于 `q_weights.dat` 的文件名。
 
-正常模式下可从标准输入读取方块序列：
+正常模式默认从标准输入读取方块序列，也可通过 `-i` 指定输入文件：
 
 ```powershell
 Get-Content .\3.txt | .\eluose.exe
-```
-
-也可将序列文件作为参数：
-
-```powershell
-.\eluose.exe .\3.txt
+.\eluose.exe -i .\3.txt
 ```
 
 模型文件每行一个浮点权重，共 6 行。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
 
 ## 4. 使用与解读注意事项
 
-1. 训练用的方块序列是通过 `rand()%7` 在线随机生成的，不会读取 `1.txt`、`2.txt` 或 `3.txt`。这些文件只用于正常运行时提供方块序列。
+1. 训练方块从 `stdin` 或 `-i` 指定的输入源读取；遇到 EOF、`E` 或 `X` 会停止训练。
 2. `q_weights.dat` 是纯权重文件，不包含随机种子、训练局数或超参数。程序加载后会继续训练；想比较不同实验，需自行备份模型。
-3. 当前训练采用单个随机后继方块估计下一状态价值，并对候选动作取最大值。这是对随机方块环境的简化估计，训练结果会有随机波动。
+3. 训练按输入序列读取方块，但 epsilon-greedy 仍会随机探索落点；追踪文件记录每一步实际训练的方块编号。
 4. 训练局数增加不保证策略一定变强。可固定测试方块序列，在训练前后比较总分、存活步数或顶出次数。
 5. 特征计算是在方块临时放置后、实际消行清理前进行；下一状态则是在真实消行清理后计算。理解训练行为时要注意这两个棋盘时点不同。
 6. 代码将顶出边界固定为 `y + block_height > 14`，并将游戏最高高度也按此规则判负；修改棋盘尺寸或边界规则时，应同步检查特征提取、候选生成、奖励和游戏逻辑。
