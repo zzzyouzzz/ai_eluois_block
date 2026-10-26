@@ -375,9 +375,94 @@ static int record_training_data(FILE *trace,int episode,unsigned long long turn,
     return 1;
 }
 
+#ifndef TD_N
+#define TD_N 1
+#endif
+#if TD_N < 1
+#error TD_N must be greater than zero
+#endif
+
+typedef struct{
+    unsigned long long turn;
+    int shape;
+    training_action action;
+    double epsilon;
+    int score;
+    double reward;
+}training_transition;
+
+static int update_training_transition(FILE *trace,int episode,double alpha,
+                                      double gamma,
+                                      const training_transition *transitions,
+                                      int transition_count,double bootstrap,
+                                      int terminal){
+    const training_transition *transition=&transitions[0];
+    double current_value=transition->action.value;
+    double target=0.0,discount=1.0;
+    for(int i=0;i<transition_count;i++){
+        target+=discount*transitions[i].reward;
+        discount*=gamma;
+    }
+    double next_value=terminal?0.0:discount*bootstrap;
+    target+=next_value;
+    double delta=target-current_value;
+    double norm=1.0;
+    for(int i=0;i<FEATURE_COUNT;i++)
+        norm+=transition->action.features[i]*transition->action.features[i];
+    if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
+       !isfinite(norm)){
+        fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",
+                episode,transition->turn);
+        return 0;
+    }
+
+    double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
+    for(int i=0;i<FEATURE_COUNT;i++){
+        before[i]=value_weights[i];
+        updates[i]=alpha*delta*transition->action.features[i]/norm;
+        after[i]=before[i]+updates[i];
+        if(!isfinite(after[i])){
+            fprintf(stderr,
+                    "权重数值异常：episode=%d turn=%llu feature=%d\n",
+                    episode,transition->turn,i);
+            return 0;
+        }
+    }
+    if(!record_training_data(trace,episode,transition->turn,
+                             transition->shape,&transition->action,
+                             transition->epsilon,transition->score,
+                             transition->reward,terminal,current_value,
+                             next_value,target,delta,norm,before,updates,after))
+        return 0;
+    for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
+    return 1;
+}
+
+static int flush_training_transitions(FILE *trace,int episode,double alpha,
+                                     double gamma,
+                                     training_transition pending[TD_N],
+                                     int *pending_count,int penalize_last,
+                                     int *has_training_data){
+    if(penalize_last&&*pending_count>0)
+        pending[*pending_count-1].reward-=200.0;
+
+    while(*pending_count>0){
+        if(!update_training_transition(trace,episode,alpha,gamma,pending,
+                                       *pending_count,0.0,1))
+            return 0;
+        memmove(pending,pending+1,
+                (size_t)(*pending_count-1)*sizeof(pending[0]));
+        (*pending_count)--;
+        *has_training_data=1;
+    }
+    return 1;
+}
+
 static int train_value_episode(FILE *block_input,FILE *trace,int episode,
                                double epsilon,int *has_training_data){
     const double alpha=0.01,gamma=0.90;
+    training_transition pending[TD_N];
+    int pending_count=0;
     for(int i=0;i<25;i++)
         for(int j=0;j<15;j++)board[i][j]=0;
     *has_training_data=0;
@@ -386,59 +471,67 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
 
     for(unsigned long long turn=1;;turn++){
         training_action action=generate_action(shape,epsilon,value_weights);
-        if(!action.valid)return 1;
+        if(!action.valid){
+            return flush_training_transitions(trace,episode,alpha,gamma,
+                                              pending,&pending_count,
+                                              pending_count>0,
+                                              has_training_data);
+        }
+
+        training_transition transition={0};
+        transition.turn=turn;
+        transition.shape=shape;
+        transition.action=action;
+        transition.epsilon=epsilon;
+
         int fill[4],full_rows[4],fill_line;
         int score=place_block(shape,action.rotation,action.x,action.y,
                               fill,full_rows,&fill_line);
-        if(score<0)break;
+        if(score<0){
+            fprintf(stderr,"训练动作无法放置：episode=%d turn=%llu\n",
+                    episode,turn);
+            return 0;
+        }
         clear_lines(full_rows,fill_line);
 
         int terminal=action.top_out;
-        double reward=score-(action.top_out?200.0:0.0);
-        double next_value=0.0;
+        transition.score=score;
+        transition.reward=score-(action.top_out?200.0:0.0);
+        pending[pending_count]=transition;
+        pending_count++;
+
         int next_shape=-1;
         if(!terminal){
             next_shape=get_block(block_input);
-            if(next_shape<0||next_shape==7){
-                terminal=1;
-            }else{
-                training_action next_action=
-                    generate_action(next_shape,0.0,value_weights);
-                if(!next_action.valid||next_action.top_out){
-                    reward-=200.0;
-                    terminal=1;
-                }else{
-                    next_value=gamma*next_action.value;
-                }
-            }
+            terminal=next_shape<0||next_shape==7;
         }
-
-        double current_value=action.value;
-        double target=reward+next_value;
-        double delta=target-current_value;
-        double norm=1.0;
-        for(int i=0;i<FEATURE_COUNT;i++)
-            norm+=action.features[i]*action.features[i];
-        double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
-        for(int i=0;i<FEATURE_COUNT;i++){
-            before[i]=value_weights[i];
-            updates[i]=alpha*delta*action.features[i];
-            after[i]=before[i]+updates[i];
-            if(!isfinite(after[i])){
-                fprintf(stderr,
-                        "权重数值异常：episode=%d turn=%llu feature=%d\n",
-                        episode,turn,i);
-                return 0;
-            }
-        }
-        if(!record_training_data(trace,episode,turn,shape,&action,
-                                 epsilon,score,reward,terminal,current_value,
-                                 next_value,target,delta,norm,before,updates,after))
-            return 0;
-        for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
 
         *has_training_data=1;
-        if(terminal)break;
+        if(terminal){
+            if(!flush_training_transitions(trace,episode,alpha,gamma,
+                                           pending,&pending_count,0,
+                                           has_training_data))
+                return 0;
+            break;
+        }
+
+        if(pending_count==TD_N){
+            training_action bootstrap=
+                generate_action(next_shape,0.0,value_weights);
+            if(!bootstrap.valid||bootstrap.top_out){
+                if(!flush_training_transitions(trace,episode,alpha,gamma,
+                                               pending,&pending_count,1,
+                                               has_training_data))
+                    return 0;
+                break;
+            }
+            if(!update_training_transition(trace,episode,alpha,gamma,pending,
+                                          TD_N,bootstrap.value,0))
+                return 0;
+            memmove(pending,pending+1,
+                    (size_t)(pending_count-1)*sizeof(pending[0]));
+            pending_count--;
+        }
         shape=next_shape;
     }
     return 1;

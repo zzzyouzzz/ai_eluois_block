@@ -16,7 +16,7 @@
 | 动作（Action） | 当前方块的旋转角度、横坐标和最终落点 |
 | 奖励（Reward） | 消行得分，以及顶出棋盘时的惩罚 |
 | 策略（Policy） | 根据动作价值选择落点的方法 |
-| 回合（Episode） | 从空棋盘开始，直到游戏结束或达到回合上限的一局训练 |
+| 回合（Episode） | 从空棋盘开始，直到游戏结束或输入序列耗尽的一局训练 |
 
 智能体执行动作后，棋盘发生变化，得到下一个状态。训练的目标不是只挑眼前看起来最好的落点，而是让当前选择也考虑后续可能得到的回报。
 
@@ -36,6 +36,8 @@ delta  = target - Q(state, action)
 ```
 
 `delta` 称为 TD 误差，表示当前估值与新目标之间的差距。若游戏已经结束，则没有后继价值，目标只包含即时奖励。
+
+训练代码通过编译宏 `TD_N` 控制 n-step TD 的步数，默认值为 `1`（例如编译时使用 `-DTD_N=3`）。训练会逐步执行后续落子并暂存转移；累计到 N 步后，使用这 N 步的折扣奖励和后继状态价值更新最早的转移。游戏结束或输入耗尽时，会用剩余奖励冲刷暂存转移，不再加入后继价值。
 
 ### 1.3 本程序的线性函数近似
 
@@ -380,12 +382,12 @@ episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next
 ### 2.9 核心训练函数 `train_value_model`
 
 ```c
-const double alpha=0.15,gamma=0.90;
+const double alpha=0.01,gamma=0.90;
 srand((unsigned int)time(NULL));
 ```
 
 - `alpha` 是学习率，控制每次权重更新的幅度。较大时学习快但可能不稳定，较小时更新平缓。
-- `gamma` 是未来价值折扣率。程序用它折扣下一步的最大价值。
+- `gamma` 是未来价值折扣率。程序用它折扣后续 N 步奖励和 bootstrap 价值。
 - `srand` 使用当前时间初始化伪随机数生成器，用于 epsilon-greedy 动作探索。训练方块不再随机生成，而是按输入序列调用 `get_block` 读取。
 
 #### 开始每一局并清空棋盘（第 335–337 行）
@@ -448,48 +450,37 @@ clear_lines(full_rows,fill_line);
 
 ```c
 int terminal=action.top_out;
-double reward=0.34*score-(terminal?200.0:0.0);
+double reward=score-(terminal?200.0:0.0);
 ```
 
 - `terminal` 表示本次动作是否达到顶出边界。
-- 消行得分乘以 `0.34` 后作为正向奖励。
+- 消行得分作为正向奖励。
 - 顶出时再减去 `200`，形成终局惩罚。
 
-```c
-double next_value=0.0;
-int next_shape=get_block(block_input);
-```
+当前动作及奖励暂存到 `pending` 数组中。未终局时从输入流读取下一个方块，训练循环继续调用 `generate_action` 并实际执行下一次放置，棋盘状态因此随循环推进。
 
-初始化下一步价值为零，并通过 `get_block(block_input)` 读取序列中的下一个方块。
+当暂存达到 `TD_N` 步时，以 `generate_action(next_shape,0.0,value_weights)` 得到后继状态的贪心估值，用于更新最早的转移，然后移除该转移并继续执行。`TD_N=1` 时对应一步 TD；增加 `TD_N` 会把多个实际执行动作的折扣奖励纳入目标。
 
-#### 估算后继动作价值（第 361–377 行）
+若没有安全的后继动作，则追加终局惩罚并结束本局。输入结束、顶出或无合法动作时，循环冲刷尚未更新的转移；终局冲刷只累加剩余的折扣奖励，不使用 bootstrap。
 
-```c
-if(!terminal){
-    training_action next_action=generate_action(next_shape,0.0,value_weights);
-    if(!next_action.valid||next_action.top_out)reward-=200.0;
-    else next_value=gamma*next_action.value;
-}
-```
-
-后继价值也由动作生成函数评估，并以 `epsilon=0` 选择贪心动作；若没有安全后继动作，则追加终局惩罚。
+所有更新条件最终都会调用 `update_training_transition`。该函数计算 TD 目标和新权重，并自动调用 `record_training_data` 保存动作价值、目标、TD 误差及每个权重的更新前后值；未启用追踪文件时，保存函数不写入数据。
 
 #### 计算 TD 误差并更新权重（第 379–423 行）
 
 ```c
-double current_value=action.value;
-double target=reward+next_value;
+double current_value=transition->action.value;
+double target=discounted_rewards+discounted_bootstrap;
 double delta=target-current_value;
 ```
 
 - `current_value` 是动作生成时、权重更新前保存的估值。
-- `target` 是 TD 目标：终局只使用即时奖励，非终局再加折扣后的后继价值。
+- `target` 是 TD 目标：使用 N 步折扣奖励；未终局时再加折扣后的后继价值。
 - `delta` 是目标减当前估值，即 TD 误差。
 
 ```c
 double norm=1.0;
 for(int i=0;i<FEATURE_COUNT;i++)
-    norm+=action.features[i]*action.features[i];
+    norm+=transition->action.features[i]*transition->action.features[i];
 ```
 
 计算特征向量平方范数，并加 `1.0` 避免除零。归一化能降低特征数值较大时单次更新过猛的风险。
