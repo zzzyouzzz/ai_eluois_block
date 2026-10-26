@@ -87,7 +87,8 @@ double value_weights[FEATURE_COUNT] = {-45.0, 34.0, -32.0, -93.0, -79.0, -34.0};
 ### 2.2 价值函数 `score_features`（第 190–194 行）
 
 ```c
-static double score_features(const double features[FEATURE_COUNT]){
+static double score_features(const double value_weights[FEATURE_COUNT],
+                             const double features[FEATURE_COUNT]){
     double score=0.0;
     for(int i=0;i<FEATURE_COUNT;i++)score+=value_weights[i]*features[i];
     return score;
@@ -100,7 +101,8 @@ static double score_features(const double features[FEATURE_COUNT]){
 2. 参数 `features` 是一个长度为 6 的特征数组。
 3. `score` 从 `0.0` 开始，使用 `double` 保留训练中的小数精度。
 4. 循环逐项累加“权重 × 特征值”，即计算向量点积 `wᵀφ`。
-5. 返回该动作的价值估计。通常分数越高，策略越倾向于选择该落点。
+5. 权重由调用方传入，函数不依赖全局模型状态。
+6. 返回该动作的价值估计。通常分数越高，策略越倾向于选择该落点。
 
 ### 2.3 提取动作特征 `extract_action_features`（第 195–217 行）
 
@@ -176,50 +178,35 @@ static int extract_action_features(int shape,int rotation,int x,int y,int block_
 - 移除刚才临时放置的方块，恢复棋盘，以免评估候选落点时互相污染。
 - 返回 `1` 表示特征成功提取。
 
-### 2.4 游戏实际选择落点时的评估 `evaluate_place`（第 219–224 行）
-
-```c
-int evaluate_place(int shape,int rotation,int x,int y,int block_height){
-    double features[FEATURE_COUNT];
-    if(y+block_height>14)return -9000000;
-    if(!extract_action_features(shape,rotation,x,y,block_height,features))return -9000000;
-    return (int)score_features(features);
-}
-```
-
-1. 创建本次候选落点的特征数组。
-2. 若放置高度超过程序约定的安全边界 `14`，直接返回很低的分数，让搜索策略避开该落点。
-3. 特征提取失败时也返回很低的分数。
-4. 否则计算线性价值并转为 `int`，供 `find_best_position` 比较候选位置。
-
-训练更新使用 `double`，而正常落点搜索的接口返回整数，因此搜索时会截去小数部分。
-
-### 2.5 训练动作结构 `training_action`（第 261–266 行）
+### 2.4 训练动作结构 `training_action`
 
 ```c
 typedef struct{
-    int rotation,x,y,top_out;
+    int valid,rotation,x,y,top_out;
     double features[FEATURE_COUNT];
     double value;
 }training_action;
 ```
 
-结构体保存一个候选动作及其评估结果：
+结构体保存动作生成函数选出的动作及其评估结果：
 
+- `valid`：是否成功生成可放置的动作。
 - `rotation`：旋转角编号。
 - `x`, `y`：横坐标和落点纵坐标。
 - `top_out`：该落点是否达到程序定义的顶出边界。
 - `features`：该动作对应的棋盘特征。
 - `value`：根据当前权重计算的动作价值，用于 epsilon-greedy 选择。
 
-### 2.6 枚举合法候选动作 `collect_actions`（第 267–285 行）
+### 2.5 生成并选择动作 `generate_action`
 
 ```c
-static int collect_actions(int shape,training_action actions[40]){
+static training_action generate_action(int shape,double epsilon,
+                                       const double value_weights[FEATURE_COUNT]){
+    training_action actions[40];
     int count=0;
 ```
 
-最多接收 40 个候选动作：旋转数最多为 4，每个旋转枚举 10 个横向位置，因此数组容量 `40` 足够。
+函数最多枚举 40 个候选动作：旋转数最多为 4，每个旋转枚举 10 个横向位置。权重和探索概率由调用方传入；无可用动作时返回 `valid` 为 0 的结果。
 
 ```c
     for(int rotation=0;rotation<block_r[shape];rotation++){
@@ -255,7 +242,7 @@ static int collect_actions(int shape,training_action actions[40]){
             action->top_out=y+block_h[shape][rotation]>14;
 ```
 
-如果放置后高度超过 `14`，标记为顶出。训练中这类动作会被赋予极低价值，并在执行后终止本局。
+如果放置后高度超过 `14`，标记为顶出。贪心选择会避开这类动作；若探索选中或所有候选都会顶出，则执行后终止本局。
 
 ```c
             extract_action_features(shape,rotation,x,y,block_h[shape][rotation],
@@ -265,23 +252,31 @@ static int collect_actions(int shape,training_action actions[40]){
 提取候选落点特征。这里候选已由合法性检查和模拟下落确定为可放置。
 
 ```c
-            action->value=action->top_out?-1000000.0:score_features(action->features);
+            action->value=score_features(value_weights,action->features);
 ```
 
-- 顶出动作直接给极低的临时价值，避免贪心策略选择它。
-- 其他动作使用当前权重计算线性价值。
-- 这只是动作选择时的当前估值，之后还会根据 TD 误差更新权重。
+- `value` 始终是使用传入权重计算出的实际价值。
+- 贪心选择优先比较非顶出动作；若所有候选都会顶出，则仍返回一个顶出动作供训练结束当前局。
 
 ```c
-        }
-    }
-    return count;
+if(count==0)return invalid;
+int selected=-1;
+if((double)rand()/((double)RAND_MAX+1.0)<epsilon){
+    selected=rand()%count;
+}else{
+    for(int i=0;i<count;i++)
+        if(!actions[i].top_out&&
+           (selected<0||actions[i].value>actions[selected].value))
+            selected=i;
+    if(selected<0)selected=0;
+}
+return actions[selected];
 }
 ```
 
-完成枚举后返回候选动作数。若没有合法候选动作，返回 `0`。
+epsilon-greedy 选择在探索时从所有候选动作中随机选取，在利用时选择价值最高的安全动作。正常模式保留原有 `find_best_position` 接口，由它以 `epsilon=0` 和当前模型权重调用该动作生成函数。
 
-### 2.7 读取模型 `load_value_model`（第 287–305 行）
+### 2.6 读取模型 `load_value_model`（第 287–305 行）
 
 ```c
 static int load_value_model(const char *path){
@@ -325,7 +320,7 @@ static int load_value_model(const char *path){
 
 关闭文件，将验证过的参数复制到全局模型，返回 `1` 表示成功加载。
 
-### 2.8 保存模型 `save_value_model`（第 307–319 行）
+### 2.7 保存模型 `save_value_model`（第 307–319 行）
 
 ```c
 static int save_value_model(const char *path){
@@ -360,7 +355,7 @@ static int save_value_model(const char *path){
 
 关闭文件并检查关闭错误。成功返回 `1`。模型文件默认名为 `q_weights.dat`，路径相对于程序运行时的当前工作目录。
 
-### 2.9 训练追踪表头 `write_training_trace_header`
+### 2.8 训练追踪表头 `write_training_trace_header`
 
 训练函数可选接收一个 CSV 文件指针。启用追踪后，程序先写表头。前 15 列为：
 
@@ -382,7 +377,7 @@ episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next
 
 `shape` 是方块编号：0=I、1=T、2=O、3=J、4=L、5=S、6=Z。
 
-### 2.10 核心训练函数 `train_value_model`
+### 2.9 核心训练函数 `train_value_model`
 
 ```c
 const double alpha=0.15,gamma=0.90;
@@ -428,32 +423,17 @@ for(unsigned long long turn=1;;turn++){
 #### 获取可选动作和 epsilon-greedy 选择（第 342–353 行）
 
 ```c
-training_action actions[40];
-int count=collect_actions(shape,actions);
-if(count==0)break;
+training_action action=generate_action(shape,epsilon,value_weights);
+if(!action.valid)return 1;
 ```
 
-建立候选数组、枚举合法落点。没有合法动作时结束本局。
-
-```c
-int selected=0;
-if((double)rand()/RAND_MAX<epsilon){
-    selected=rand()%count;
-}else{
-    for(int i=1;i<count;i++)
-        if(actions[i].value>actions[selected].value)selected=i;
-}
-```
-
-- `rand()/RAND_MAX` 生成 `[0,1]` 范围的随机比例。
-- 随机比例小于 `epsilon` 时从候选中随机选一个，进行探索。
-- 否则扫描候选动作并选择价值最高的动作，进行利用。
-- 如果多个候选价值相同，保留先出现的候选。
+- 动作生成函数统一负责枚举落点、提取特征和 epsilon-greedy 选择。
+- 训练显式传入当前权重；正常模式以 `epsilon=0` 调用相同函数。
+- 没有可执行动作时，本局结束。
 
 #### 执行动作和处理消行（第 353–360 行）
 
 ```c
-training_action action=actions[selected];
 int fill[4],full_rows[4],fill_line;
 int score=place_block(shape,action.rotation,action.x,action.y,
                       fill,full_rows,&fill_line);
@@ -486,43 +466,23 @@ int next_shape=get_block(block_input);
 
 ```c
 if(!terminal){
-    training_action next_actions[40];
-    int next_count=collect_actions(next_shape,next_actions);
-    int has_next_action=0;
-```
-
-非终局且输入仍有方块时，根据刚更新过的棋盘和输入序列中的下一个方块枚举后继动作。`has_next_action` 用来区分“最大价值确实为 0”和“没有任何非顶出动作”。
-
-```c
-    for(int i=0;i<next_count;i++){
-        if(!next_actions[i].top_out&&
-           (!has_next_action||next_actions[i].value>next_value)){
-            next_value=next_actions[i].value;
-            has_next_action=1;
-        }
-    }
-```
-
-遍历后继候选，只考虑非顶出动作，取当前模型估值最大的动作，即 `max_a' Q(next_state,a')`。
-
-```c
-    if(!has_next_action)reward-=200.0;
-    else next_value=gamma*next_value;
+    training_action next_action=generate_action(next_shape,0.0,value_weights);
+    if(!next_action.valid||next_action.top_out)reward-=200.0;
+    else next_value=gamma*next_action.value;
 }
 ```
 
-- 若没有可选的非顶出后继动作，额外扣除 `200`，将这种即将失败的局面视为不利状态。
-- 否则乘以折扣率 `gamma`，得到折扣后的下一状态价值。
+后继价值也由动作生成函数评估，并以 `epsilon=0` 选择贪心动作；若没有安全后继动作，则追加终局惩罚。
 
 #### 计算 TD 误差并更新权重（第 379–423 行）
 
 ```c
-double current_value=score_features(action.features);
-double target=reward+(terminal?0.0:next_value);
+double current_value=action.value;
+double target=reward+next_value;
 double delta=target-current_value;
 ```
 
-- `current_value` 使用执行动作时保存的特征和当前权重重新计算当前估值。
+- `current_value` 是动作生成时、权重更新前保存的估值。
 - `target` 是 TD 目标：终局只使用即时奖励，非终局再加折扣后的后继价值。
 - `delta` 是目标减当前估值，即 TD 误差。
 
@@ -552,7 +512,7 @@ shape=next_shape;
 - 顶出时结束当前训练局。
 - 否则将输入序列中的下一个方块设为下一步当前方块，继续训练。
 
-### 2.11 命令行参数
+### 2.10 命令行参数
 
 `main` 统一解析运行模式和输入源：
 

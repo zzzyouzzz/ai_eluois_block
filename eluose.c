@@ -187,7 +187,14 @@ void evaluate_board(int* drow,int* dcol,int* holes,int* well){//评估棋盘
         }
     }
 }
-static double score_features(const double features[FEATURE_COUNT]){
+typedef struct{
+    int valid,rotation,x,y,top_out;
+    double features[FEATURE_COUNT];
+    double value;
+}training_action;
+
+static double score_features(const double value_weights[FEATURE_COUNT],
+                             const double features[FEATURE_COUNT]){
     double score=0.0;
     for(int i=0;i<FEATURE_COUNT;i++)score+=value_weights[i]*features[i];
     return score;
@@ -216,30 +223,6 @@ static int extract_action_features(int shape,int rotation,int x,int y,int block_
     remove_block(shape,rotation,x,y);
     return 1;
 }
-int evaluate_place(int shape,int rotation,int x,int y,int block_height){//评估放置
-    double features[FEATURE_COUNT];
-    if(y+block_height>14)return -9000000;
-    if(!extract_action_features(shape,rotation,x,y,block_height,features))return -9000000;
-    return (int)score_features(features);
-}
-void find_best_position(int shape,int* rotation,int* x,int* y){//找到最佳放置位置
-    int best_eval=-0x7fffffff;
-    int best_priority=0x7fffffff;
-    for(int i=0;i<block_r[shape];i++){
-        for(int j=0;j<10-block_w[shape][i];j++){
-            int best_y=simulate_fall(shape,i,j);
-            int eval=evaluate_place(shape,i,j,best_y,block_h[shape][i]);
-            int priority=100*j+i;
-            if(eval>best_eval||(eval==best_eval&&priority<best_priority)){
-                best_eval=eval;
-                best_priority=priority;
-                *rotation=i;
-                *x=j;
-                *y=best_y;
-            }
-        }
-    }
-}
 int get_block(FILE *fp){
     char block;
     while((block=fgetc(fp))!='I'&&block!='T'&&block!='O'&&block!='J'&&block!='L'&&block!='S'&&block!='Z'&&block!='E'&&block!='X'){
@@ -258,30 +241,61 @@ int get_block(FILE *fp){
         default: return -1;
     }
 }
-typedef struct{
-    int rotation,x,y,top_out;
-    double features[FEATURE_COUNT];
-    double value;
-}training_action;
-
-static int collect_actions(int shape,training_action actions[40]){
+static training_action generate_action(int shape,double epsilon,
+                                       const double value_weights[FEATURE_COUNT]){
+    training_action actions[40];
     int count=0;
+    training_action invalid={0};
+    if(shape<0||shape>=7)return invalid;
+
     for(int rotation=0;rotation<block_r[shape];rotation++){
         for(int x=0;x<10;x++){
             if(!can_place(shape,rotation,x,16))continue;
             int y=simulate_fall(shape,rotation,x);
             if(y<0||y>=20)continue;
             training_action *action=&actions[count++];
+            action->valid=1;
             action->rotation=rotation;
             action->x=x;
             action->y=y;
             action->top_out=y+block_h[shape][rotation]>14;
-            extract_action_features(shape,rotation,x,y,block_h[shape][rotation],
-                                    action->features);
-            action->value=action->top_out?-1000000.0:score_features(action->features);
+            if(!extract_action_features(shape,rotation,x,y,
+                                        block_h[shape][rotation],
+                                        action->features)){
+                action->valid=0;
+                count--;
+                continue;
+            }
+            action->value=score_features(value_weights,action->features);
         }
     }
-    return count;
+    if(count==0)return invalid;
+
+    int selected=-1;
+    if((double)rand()/((double)RAND_MAX+1.0)<epsilon){
+        selected=rand()%count;
+    }else{
+        for(int i=0;i<count;i++){
+            if(!actions[i].top_out&&
+               (selected<0||actions[i].value>actions[selected].value))
+                selected=i;
+        }
+        if(selected<0)selected=0;
+    }
+    return actions[selected];
+}
+
+void find_best_position(int shape,int* rotation,int* x,int* y){
+    training_action action=generate_action(shape,0.0,value_weights);
+    if(!action.valid){
+        *rotation=0;
+        *x=0;
+        *y=-1;
+        return;
+    }
+    *rotation=action.rotation;
+    *x=action.x;
+    *y=action.y;
 }
 
 static int load_value_model(const char *path){
@@ -363,7 +377,7 @@ static int record_training_data(FILE *trace,int episode,unsigned long long turn,
 
 static int train_value_episode(FILE *block_input,FILE *trace,int episode,
                                double epsilon,int *has_training_data){
-    const double alpha=0.001,gamma=0.90;
+    const double alpha=0.01,gamma=0.90;
     for(int i=0;i<25;i++)
         for(int j=0;j<15;j++)board[i][j]=0;
     *has_training_data=0;
@@ -371,18 +385,8 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
     if(shape<0||shape==7)return 1;
 
     for(unsigned long long turn=1;;turn++){
-        training_action actions[40];
-        int count=collect_actions(shape,actions);
-        if(count==0)return 1;
-
-        int selected=0;
-        if((double)rand()/RAND_MAX<epsilon){
-            selected=rand()%count;
-        }else{
-            for(int i=1;i<count;i++)
-                if(actions[i].value>actions[selected].value)selected=i;
-        }
-        training_action action=actions[selected];
+        training_action action=generate_action(shape,epsilon,value_weights);
+        if(!action.valid)return 1;
         int fill[4],full_rows[4],fill_line;
         int score=place_block(shape,action.rotation,action.x,action.y,
                               fill,full_rows,&fill_line);
@@ -390,50 +394,35 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
         clear_lines(full_rows,fill_line);
 
         int terminal=action.top_out;
-        double reward=0.34*score-(action.top_out?200.0:0.0);
+        double reward=score-(action.top_out?200.0:0.0);
         double next_value=0.0;
         int next_shape=-1;
-        int end_of_input=0;
         if(!terminal){
             next_shape=get_block(block_input);
             if(next_shape<0||next_shape==7){
                 terminal=1;
-                end_of_input=1;
             }else{
-                training_action next_actions[40];
-                int next_count=collect_actions(next_shape,next_actions);
-                int has_next_action=0;
-                for(int i=0;i<next_count;i++){
-                    if(!next_actions[i].top_out&&
-                       (!has_next_action||next_actions[i].value>next_value)){
-                        next_value=next_actions[i].value;
-                        has_next_action=1;
-                    }
-                }
-                if(!has_next_action){
+                training_action next_action=
+                    generate_action(next_shape,0.0,value_weights);
+                if(!next_action.valid||next_action.top_out){
                     reward-=200.0;
                     terminal=1;
                 }else{
-                    next_value=gamma*next_value;
+                    next_value=gamma*next_action.value;
                 }
             }
         }
 
-        double current_value=score_features(action.features);
-        double target=reward+((action.top_out||end_of_input)?0.0:next_value);
+        double current_value=action.value;
+        double target=reward+next_value;
         double delta=target-current_value;
         double norm=1.0;
         for(int i=0;i<FEATURE_COUNT;i++)
             norm+=action.features[i]*action.features[i];
-        if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
-           !isfinite(norm)){
-            fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",episode,turn);
-            return 0;
-        }
         double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
         for(int i=0;i<FEATURE_COUNT;i++){
             before[i]=value_weights[i];
-            updates[i]=alpha*delta*action.features[i]/norm;
+            updates[i]=alpha*delta*action.features[i];
             after[i]=before[i]+updates[i];
             if(!isfinite(after[i])){
                 fprintf(stderr,
