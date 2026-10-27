@@ -168,7 +168,7 @@ static int run_case(FILE *fp,char line[256]){
 }
 
 int main(int argc,char **argv){
-    const char *path=argc>1?argv[1]:"tests\\feature_cases.cases";
+    const char *path=argc>1?argv[1]:"tests\\feature_cases.txt";
     if(argc>2){
         fprintf(stderr,"Usage: %s [test-data-file]\n",argv[0]);
         return EXIT_FAILURE;
