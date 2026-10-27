@@ -376,7 +376,7 @@ static int record_training_data(FILE *trace,int episode,unsigned long long turn,
 }
 
 #ifndef TD_N
-#define TD_N 1
+#define TD_N 5
 #endif
 #if TD_N < 1
 #error TD_N must be greater than zero
@@ -489,7 +489,7 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
 
         int terminal=action.top_out;
         transition.score=score;
-        transition.reward=score-(action.top_out?200.0:0.0);
+        transition.reward=10*score-(action.top_out?8000.0:0.0);
         pending[pending_count]=transition;
         pending_count++;
 

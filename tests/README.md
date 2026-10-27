@@ -10,6 +10,8 @@ gcc -std=c11 -Wall -Wextra -pedantic tests\test_game.c -o tests\test_game.exe
 .\tests\test_game.exe
 gcc -std=c11 -Wall -Wextra -pedantic tests\test_training_update.c -o tests\test_training_update.exe
 .\tests\test_training_update.exe
+gcc -std=c11 -Wall -Wextra -pedantic tests\test_extract_action_features.c -o tests\test_extract_action_features.exe
+.\tests\test_extract_action_features.exe
 ```
 
 An alternate test-data file can be passed as the first argument.
@@ -79,3 +81,32 @@ The cases verify:
 
 These are focused unit tests of the update function; they do not run a training
 episode or inspect CSV trace formatting.
+
+## Action feature tests
+
+`test_extract_action_features.c` loops over `feature_cases.cases`. Each case
+contains a 20-row board picture (`O` existing blocks, `X` the current piece,
+`.` empty), one placement, whether feature extraction should succeed, and six
+named expected values. The picture shows the piece already placed. The driver
+checks that the `X` cells match the action's shape, rotation and coordinates,
+uses only `O` cells as the input board, invokes `extract_action_features`,
+checks each feature, and verifies that the temporary placement leaves the
+input board unchanged. An alternate data file can be passed as the first
+argument.
+
+The Chinese feature labels in each case mean:
+
+| Label | Feature meaning |
+| --- | --- |
+| `高度` | `y + block_height - 1`, the placed piece's top row |
+| `消行特征` | Number of full rows times the placed piece's cells in those rows |
+| `行方向变化` | Horizontal occupied/empty transitions across each board row |
+| `列方向变化` | Vertical occupied/empty transitions down each board column |
+| `洞数` | Empty cells below an occupied cell in the same column |
+| `井深` | For each column, accumulated depth of empty cells whose horizontal neighbors are occupied; the running depth resets at an occupied cell |
+
+Cases cover an empty board, completing one line with an O, a buried hole, a
+well between walls, a vertical I over an uneven stack, a T above a terraced
+board with holes and wells, and stacked placements with nonzero height. Two
+dense-board cases show eight occupied rows each (six existing rows plus the
+current piece), with varying terraces, holes, and wells.
