@@ -391,69 +391,57 @@ typedef struct{
     double reward;
 }training_transition;
 
-static int update_training_transition(FILE *trace,int episode,double alpha,
-                                      double gamma,
-                                      const training_transition *transitions,
-                                      int transition_count,double bootstrap,
-                                      int terminal){
-    const training_transition *transition=&transitions[0];
-    double current_value=transition->action.value;
-    double target=0.0,discount=1.0;
-    for(int i=0;i<transition_count;i++){
-        target+=discount*transitions[i].reward;
-        discount*=gamma;
-    }
-    double next_value=terminal?0.0:discount*bootstrap;
-    target+=next_value;
-    double delta=target-current_value;
-    double norm=1.0;
-    for(int i=0;i<FEATURE_COUNT;i++)
-        norm+=transition->action.features[i]*transition->action.features[i];
-    if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
-       !isfinite(norm)){
-        fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",
-                episode,transition->turn);
+static int update_training_transitions(FILE *trace,int episode,double alpha,
+                                       double gamma,
+                                       const training_transition pending[TD_N],
+                                       int queue_length,double bootstrap){
+    if(queue_length<0||queue_length>TD_N){
+        fprintf(stderr,"训练转移队列长度无效\n");
         return 0;
     }
+    if(queue_length==0)return 1;
 
-    double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
-    for(int i=0;i<FEATURE_COUNT;i++){
-        before[i]=value_weights[i];
-        updates[i]=alpha*delta*transition->action.features[i]/norm;
-        after[i]=before[i]+updates[i];
-        if(!isfinite(after[i])){
-            fprintf(stderr,
-                    "权重数值异常：episode=%d turn=%llu feature=%d\n",
-                    episode,transition->turn,i);
+    for(int transition_index=0;transition_index<queue_length;
+        transition_index++){
+        const training_transition *transition=&pending[transition_index];
+        double current_value=transition->action.value;
+        double target=0.0,discount=1.0;
+        for(int i=transition_index;i<queue_length;i++){
+            target+=discount*pending[i].reward;
+            discount*=gamma;
+        }
+        double next_value=discount*bootstrap;
+        target+=next_value;
+        double delta=target-current_value;
+        double norm=1.0;
+        for(int i=0;i<FEATURE_COUNT;i++)
+            norm+=transition->action.features[i]*transition->action.features[i];
+        if(!isfinite(current_value)||!isfinite(target)||!isfinite(delta)||
+           !isfinite(norm)){
+            fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",
+                    episode,transition->turn);
             return 0;
         }
-    }
-    if(!record_training_data(trace,episode,transition->turn,
-                             transition->shape,&transition->action,
-                             transition->epsilon,transition->score,
-                             transition->reward,terminal,current_value,
-                             next_value,target,delta,norm,before,updates,after))
-        return 0;
-    for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
-    return 1;
-}
 
-static int flush_training_transitions(FILE *trace,int episode,double alpha,
-                                     double gamma,
-                                     training_transition pending[TD_N],
-                                     int *pending_count,int penalize_last,
-                                     int *has_training_data){
-    if(penalize_last&&*pending_count>0)
-        pending[*pending_count-1].reward-=200.0;
-
-    while(*pending_count>0){
-        if(!update_training_transition(trace,episode,alpha,gamma,pending,
-                                       *pending_count,0.0,1))
+        double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
+        for(int i=0;i<FEATURE_COUNT;i++){
+            before[i]=value_weights[i];
+            updates[i]=alpha*delta*transition->action.features[i]/norm;
+            after[i]=before[i]+updates[i];
+            if(!isfinite(after[i])){
+                fprintf(stderr,
+                        "权重数值异常：episode=%d turn=%llu feature=%d\n",
+                        episode,transition->turn,i);
+                return 0;
+            }
+        }
+        if(!record_training_data(trace,episode,transition->turn,
+                                 transition->shape,&transition->action,
+                                 transition->epsilon,transition->score,
+                                 transition->reward,bootstrap==0.0,current_value,
+                                 next_value,target,delta,norm,before,updates,after))
             return 0;
-        memmove(pending,pending+1,
-                (size_t)(*pending_count-1)*sizeof(pending[0]));
-        (*pending_count)--;
-        *has_training_data=1;
+        for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
     }
     return 1;
 }
@@ -472,10 +460,15 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
     for(unsigned long long turn=1;;turn++){
         training_action action=generate_action(shape,epsilon,value_weights);
         if(!action.valid){
-            return flush_training_transitions(trace,episode,alpha,gamma,
-                                              pending,&pending_count,
-                                              pending_count>0,
-                                              has_training_data);
+            if(pending_count>0){
+                pending[pending_count-1].reward-=200.0;
+                if(!update_training_transitions(trace,episode,alpha,gamma,
+                                               pending,pending_count,0.0))
+                    return 0;
+                pending_count=0;
+                *has_training_data=1;
+            }
+            return 1;
         }
 
         training_transition transition={0};
@@ -508,10 +501,10 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
 
         *has_training_data=1;
         if(terminal){
-            if(!flush_training_transitions(trace,episode,alpha,gamma,
-                                           pending,&pending_count,0,
-                                           has_training_data))
+            if(!update_training_transitions(trace,episode,alpha,gamma,
+                                            pending,pending_count,0.0))
                 return 0;
+            pending_count=0;
             break;
         }
 
@@ -519,18 +512,17 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
             training_action bootstrap=
                 generate_action(next_shape,0.0,value_weights);
             if(!bootstrap.valid||bootstrap.top_out){
-                if(!flush_training_transitions(trace,episode,alpha,gamma,
-                                               pending,&pending_count,1,
-                                               has_training_data))
+                pending[pending_count-1].reward-=200.0;
+                if(!update_training_transitions(trace,episode,alpha,gamma,
+                                                pending,pending_count,0.0))
                     return 0;
+                pending_count=0;
                 break;
             }
-            if(!update_training_transition(trace,episode,alpha,gamma,pending,
-                                          TD_N,bootstrap.value,0))
+            if(!update_training_transitions(trace,episode,alpha,gamma,pending,
+                                            pending_count,bootstrap.value))
                 return 0;
-            memmove(pending,pending+1,
-                    (size_t)(pending_count-1)*sizeof(pending[0]));
-            pending_count--;
+            pending_count=0;
         }
         shape=next_shape;
     }

@@ -8,6 +8,8 @@ Run from the repository root in PowerShell:
 ```powershell
 gcc -std=c11 -Wall -Wextra -pedantic tests\test_game.c -o tests\test_game.exe
 .\tests\test_game.exe
+gcc -std=c11 -Wall -Wextra -pedantic tests\test_training_update.c -o tests\test_training_update.exe
+.\tests\test_training_update.exe
 ```
 
 An alternate test-data file can be passed as the first argument.
@@ -59,3 +61,21 @@ The 30 cases cover:
 
 The expected boards are explicit data, not reconstructed by the test driver,
 and comparisons include all 25 rows and 15 columns of the board array.
+
+## Training update tests
+
+`test_training_update.c` includes `eluose.c` with the application entry point
+renamed, then directly invokes `update_training_transitions` with small,
+hand-built transition queues. The test-only default `TD_N=3` allows a
+three-transition case without changing the production default.
+
+The cases verify:
+
+- A three-transition update uses discounted rewards and the supplied bootstrap
+  value to update each corresponding feature weight.
+- A shorter queue with zero bootstrap uses its actual length and omits the
+  future-state value.
+- An empty queue succeeds without changing any weights.
+
+These are focused unit tests of the update function; they do not run a training
+episode or inspect CSV trace formatting.
