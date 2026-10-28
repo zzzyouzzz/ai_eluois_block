@@ -7,173 +7,480 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
-FEATURE_NAMES = ["height", "line_clear", "drow", "dcol", "holes", "well"]
+FEATURE_NAMES = ["高度", "消行", "行变化", "列变化", "洞数", "井深"]
+WEIGHT_NAMES = [f"w{i}（{name}）" for i, name in enumerate(FEATURE_NAMES)]
+LINE_CLEAR_COUNTS = {0: 0, 100: 1, 300: 2, 500: 3, 800: 4}
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Visualize episode returns and feature/weight changes from a training trace."
-    )
-    parser.add_argument("trace", nargs="?", default="training_trace.csv")
-    parser.add_argument(
-        "--output", default="training_analysis_1000.png", help="Output image path."
-    )
-    args = parser.parse_args()
+def parse_number(row, key, row_number):
+    try:
+        value = float(row[key])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit(
+            f"CSV 第 {row_number} 行的 {key} 不是有效数字：{error}"
+        ) from error
+    if not math.isfinite(value):
+        raise SystemExit(f"CSV 第 {row_number} 行的 {key} 不是有限数")
+    return value
 
-    trace_path = Path(args.trace)
-    if not trace_path.is_file():
-        raise SystemExit(f"Trace file not found: {trace_path}")
 
-    required = {"episode", "turn", "score", "td_error"}
-    for i in range(6):
-        required.update(
-            {
-                f"feature{i}",
-                f"weight_after{i}",
-                f"weight_delta{i}",
-            }
-        )
+def rolling_mean(values, window):
+    result = []
+    running_sum = 0.0
+    for index, value in enumerate(values):
+        running_sum += value
+        if index >= window:
+            running_sum -= values[index - window]
+        result.append(running_sum / min(index + 1, window))
+    return result
 
+
+def prepare_matplotlib():
+    plt.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def feature_scale(index, value, board_cells):
+    if index == 0:
+        return value / 20.0
+    if index == 1:
+        return value / 4.0
+    return value / max(board_cells, 4.0)
+
+
+def load_training_trace(path):
+    required = {
+        "episode",
+        "turn",
+        "epsilon",
+        "score",
+        "terminal",
+        "td_error",
+        "board_cells",
+    }
+    required.update(f"feature{i}" for i in range(6))
+    required.update(f"weight_after{i}" for i in range(6))
+    required.update(f"weight_before{i}" for i in range(6))
     episodes = defaultdict(
         lambda: {
             "score": 0.0,
-            "turns": 0,
+            "steps": 0,
+            "epsilon_sum": 0.0,
             "td_abs_sum": 0.0,
+            "top_outs": 0,
+            "line_clears": 0,
+            "features": [0.0] * 6,
+            "contributions": [0.0] * 6,
             "weights": [None] * 6,
-            "feature_abs_sum": [0.0] * 6,
-            "delta_abs_sum": [0.0] * 6,
         }
     )
-    updates = 0
+    rows = 0
 
-    with trace_path.open("r", newline="", encoding="utf-8-sig") as trace_file:
-        reader = csv.DictReader(trace_file)
-        missing = required.difference(reader.fieldnames or [])
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        columns = set(reader.fieldnames or [])
+        missing = required - columns
         if missing:
-            raise SystemExit(f"Trace is missing columns: {', '.join(sorted(missing))}")
-
-        for row in reader:
+            raise SystemExit(f"训练追踪缺少列：{', '.join(sorted(missing))}")
+        for row_number, row in enumerate(reader, start=2):
             try:
-                episode = int(row["episode"])
-                score = float(row["score"])
-                td_error = float(row["td_error"])
-                features = [float(row[f"feature{i}"]) for i in range(6)]
-                weights = [float(row[f"weight_after{i}"]) for i in range(6)]
-                deltas = [float(row[f"weight_delta{i}"]) for i in range(6)]
-            except (TypeError, ValueError) as error:
-                raise SystemExit(f"Invalid numeric value on CSV row {updates + 2}: {error}")
-
-            values = [score, td_error, *features, *weights, *deltas]
-            if not all(math.isfinite(value) for value in values):
+                episode = int(parse_number(row, "episode", row_number))
+                parse_number(row, "turn", row_number)
+                score = parse_number(row, "score", row_number)
+                epsilon = parse_number(row, "epsilon", row_number)
+                features = [
+                    parse_number(row, f"feature{i}", row_number)
+                    for i in range(6)
+                ]
+                before = [
+                    parse_number(row, f"weight_before{i}", row_number)
+                    for i in range(6)
+                ]
+                weights = [
+                    parse_number(row, f"weight_after{i}", row_number)
+                    for i in range(6)
+                ]
+                terminal = int(parse_number(row, "terminal", row_number))
+                td_error = parse_number(row, "td_error", row_number)
+                board_cells = parse_number(row, "board_cells", row_number)
+            except ValueError as error:
                 raise SystemExit(
-                    f"Non-finite value found on CSV row {updates + 2}; "
-                    "the trace cannot be analyzed safely."
-                )
+                    f"CSV 第 {row_number} 行包含无效局数或步数：{error}"
+                ) from error
 
             data = episodes[episode]
+            data["steps"] += 1
+            data["epsilon_sum"] += epsilon
             data["score"] += score
-            data["turns"] += 1
+            data["top_outs"] += terminal
+            lines_cleared = LINE_CLEAR_COUNTS.get(int(score), 0)
+            data["line_clears"] += lines_cleared
+
+            for index in range(6):
+                normalized = feature_scale(index, features[index], board_cells)
+                data["features"][index] += normalized
+                data["contributions"][index] += before[index] * normalized
+                data["weights"][index] = weights[index]
             data["td_abs_sum"] += abs(td_error)
-            data["weights"] = weights
-            for i in range(6):
-                data["feature_abs_sum"][i] += abs(features[i])
-                data["delta_abs_sum"][i] += abs(deltas[i])
-            updates += 1
+            rows += 1
 
     if not episodes:
-        raise SystemExit(f"No training updates found in {trace_path}")
+        raise SystemExit(f"训练追踪中没有数据：{path}")
 
+    result = {}
+    for episode, data in episodes.items():
+        steps = data["steps"]
+        result[episode] = {
+            "score": data["score"],
+            "steps": steps,
+            "epsilon": data["epsilon_sum"] / steps,
+            "td_abs": data["td_abs_sum"] / steps,
+            "top_out_rate": data["top_outs"] / steps,
+            "line_clears_per_move": data["line_clears"] / steps,
+            "features": [value / steps for value in data["features"]],
+            "contributions": [
+                value / steps for value in data["contributions"]
+            ],
+            "weights": data["weights"],
+        }
+    return result, rows
+
+
+def plot_training(trace_path, episodes, rows, window, output_path):
     episode_ids = sorted(episodes)
-    scores = [episodes[episode]["score"] for episode in episode_ids]
-    weight_series = [
-        [episodes[episode]["weights"][i] for episode in episode_ids]
+    scores = [episodes[e]["score"] for e in episode_ids]
+    steps = [episodes[e]["steps"] for e in episode_ids]
+    epsilons = [episodes[e]["epsilon"] for e in episode_ids]
+    weights = [
+        [episodes[e]["weights"][i] for e in episode_ids] for i in range(6)
+    ]
+    features = [
+        rolling_mean(
+            [episodes[e]["features"][i] for e in episode_ids], window
+        )
         for i in range(6)
     ]
-    mean_abs_features = [
-        [
-            episodes[episode]["feature_abs_sum"][i] / episodes[episode]["turns"]
-            for episode in episode_ids
-        ]
+    contributions = [
+        rolling_mean(
+            [episodes[e]["contributions"][i] for e in episode_ids], window
+        )
         for i in range(6)
     ]
-    mean_abs_deltas = [
-        [
-            episodes[episode]["delta_abs_sum"][i] / episodes[episode]["turns"]
-            for episode in episode_ids
-        ]
-        for i in range(6)
-    ]
-    mean_abs_td = [
-        episodes[episode]["td_abs_sum"] / episodes[episode]["turns"]
-        for episode in episode_ids
-    ]
 
-    figure, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
-    figure.suptitle(f"Q-learning training trace: {trace_path.name} ({updates:,} updates)")
+    figure, axes = plt.subplots(3, 2, figsize=(17, 14), constrained_layout=True)
+    figure.suptitle(
+        f"训练过程分析：{trace_path.name}（{len(episode_ids)} 局，{rows:,} 步）"
+    )
 
-    axes[0, 0].plot(episode_ids, scores, linewidth=0.8, alpha=0.55, label="Episode score")
-    if len(scores) >= 10:
-        window = max(1, len(scores) // 50)
-        rolling = [
-            sum(scores[max(0, i - window + 1) : i + 1])
-            / len(scores[max(0, i - window + 1) : i + 1])
-            for i in range(len(scores))
-        ]
-        axes[0, 0].plot(episode_ids, rolling, linewidth=2, label=f"Rolling mean ({window})")
-    axes[0, 0].set_title("Episode score")
-    axes[0, 0].set_xlabel("Episode")
-    axes[0, 0].set_ylabel("Score")
-    axes[0, 0].legend()
-    axes[0, 0].grid(alpha=0.25)
+    ax = axes[0, 0]
+    ax.plot(episode_ids, scores, color="#9bb7d4", alpha=0.4, linewidth=0.7,
+            label="每局得分")
+    ax.plot(
+        episode_ids,
+        rolling_mean(scores, window),
+        color="#1769aa",
+        linewidth=2,
+        label=f"得分滚动均值（{window} 局）",
+    )
+    step_ax = ax.twinx()
+    step_ax.plot(
+        episode_ids,
+        rolling_mean(steps, window),
+        color="#e67e22",
+        linewidth=1.7,
+        label=f"存活步数滚动均值（{window} 局）",
+    )
+    ax.set_title("训练得分与存活步数")
+    ax.set_xlabel("训练局数")
+    ax.set_ylabel("得分")
+    step_ax.set_ylabel("存活步数")
+    ax.grid(alpha=0.25)
+    handles, labels = ax.get_legend_handles_labels()
+    other_handles, other_labels = step_ax.get_legend_handles_labels()
+    ax.legend(handles + other_handles, labels + other_labels, fontsize=8)
 
-    for i, name in enumerate(FEATURE_NAMES):
-        axes[0, 1].plot(episode_ids, weight_series[i], label=name, linewidth=1)
-    axes[0, 1].set_title("Weights after each episode")
-    axes[0, 1].set_xlabel("Episode")
-    axes[0, 1].set_ylabel("Weight (symlog scale)")
-    axes[0, 1].set_yscale("symlog", linthresh=1)
-    axes[0, 1].legend(ncol=2, fontsize=8)
+    axes[0, 1].plot(episode_ids, epsilons, color="#7b1fa2", linewidth=1.5)
+    axes[0, 1].set_title("探索率 epsilon")
+    axes[0, 1].set_xlabel("训练局数")
+    axes[0, 1].set_ylabel("epsilon")
     axes[0, 1].grid(alpha=0.25)
 
-    for i, name in enumerate(FEATURE_NAMES):
-        axes[1, 0].plot(episode_ids, mean_abs_deltas[i], label=name, linewidth=1)
-    axes[1, 0].set_title("Mean absolute weight change per move")
-    axes[1, 0].set_xlabel("Episode")
-    axes[1, 0].set_ylabel("Mean |weight delta|")
-    axes[1, 0].set_yscale("symlog", linthresh=1e-4)
+    for index, name in enumerate(WEIGHT_NAMES):
+        axes[1, 0].plot(
+            episode_ids, weights[index], label=name, linewidth=1.2
+        )
+    axes[1, 0].set_title("六个参数变化")
+    axes[1, 0].set_xlabel("训练局数")
+    axes[1, 0].set_ylabel("权重")
+    axes[1, 0].set_yscale("symlog", linthresh=1)
     axes[1, 0].legend(ncol=2, fontsize=8)
     axes[1, 0].grid(alpha=0.25)
 
-    for i, name in enumerate(FEATURE_NAMES):
-        axes[1, 1].plot(episode_ids, mean_abs_features[i], label=name, linewidth=1)
-    axes[1, 1].set_title("Mean absolute feature value per move")
-    axes[1, 1].set_xlabel("Episode")
-    axes[1, 1].set_ylabel("Mean |feature|")
+    for index, name in enumerate(FEATURE_NAMES):
+        axes[1, 1].plot(
+            episode_ids, features[index], label=name, linewidth=1.2
+        )
+    axes[1, 1].set_title("归一化特征均值（滚动）")
+    axes[1, 1].set_xlabel("训练局数")
+    axes[1, 1].set_ylabel("归一化特征值")
     axes[1, 1].legend(ncol=2, fontsize=8)
     axes[1, 1].grid(alpha=0.25)
 
-    output_path = Path(args.output)
+    for index, name in enumerate(FEATURE_NAMES):
+        axes[2, 0].plot(
+            episode_ids,
+            contributions[index],
+            label=name,
+            linewidth=1.2,
+        )
+    axes[2, 0].axhline(0, color="black", linewidth=0.7, alpha=0.6)
+    axes[2, 0].set_title("权重 × 归一化特征（对价值的平均贡献）")
+    axes[2, 0].set_xlabel("训练局数")
+    axes[2, 0].set_ylabel("平均价值贡献")
+    axes[2, 0].legend(ncol=2, fontsize=8)
+    axes[2, 0].grid(alpha=0.25)
+
+    top_out_rates = [
+        episodes[e]["top_out_rate"] for e in episode_ids
+    ]
+    clear_rates = [
+        episodes[e]["line_clears_per_move"] for e in episode_ids
+    ]
+    axes[2, 1].plot(
+        episode_ids,
+        rolling_mean(clear_rates, window),
+        color="#2e7d32",
+        label="每步消行数",
+    )
+    axes[2, 1].plot(
+        episode_ids,
+        rolling_mean(top_out_rates, window),
+        color="#c62828",
+        label="顶出率",
+    )
+    axes[2, 1].plot(
+        episode_ids,
+        rolling_mean(
+            [episodes[e]["td_abs"] for e in episode_ids], window
+        ),
+        color="#455a64",
+        label="平均绝对 TD 误差",
+    )
+    axes[2, 1].set_title("训练稳定性与消行效率")
+    axes[2, 1].set_xlabel("训练局数")
+    axes[2, 1].set_ylabel("滚动均值 / 比率")
+    axes[2, 1].legend(fontsize=8)
+    axes[2, 1].grid(alpha=0.25)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=160)
     plt.close(figure)
 
-    print(f"Trace: {trace_path}")
-    print(f"Episodes: {len(episode_ids)}; updates: {updates}")
-    print(f"Mean episode score: {sum(scores) / len(scores):.3f}")
-    print(f"Mean absolute TD error: {sum(mean_abs_td) / len(mean_abs_td):.3f}")
-    print("Feature summary:")
-    summary = []
-    for i, name in enumerate(FEATURE_NAMES):
-        mean_feature = sum(mean_abs_features[i]) / len(episode_ids)
-        mean_delta = sum(mean_abs_deltas[i]) / len(episode_ids)
-        final_weight = weight_series[i][-1]
-        summary.append((mean_delta, name, mean_feature, final_weight))
-    for mean_delta, name, mean_feature, final_weight in sorted(summary, reverse=True):
-        print(
-            f"  {name:10s} mean|feature|={mean_feature:.6g} "
-            f"mean|delta_w|={mean_delta:.6g} final_weight={final_weight:.6g}"
+
+def load_evaluation_trace(path):
+    required = {
+        "episode",
+        "mean_score",
+        "mean_survival_steps",
+        "top_out_rate",
+    }
+    required.update(f"feature{i}" for i in range(6))
+    required.update(f"weight{i}" for i in range(6))
+    required.update(f"contribution{i}" for i in range(6))
+    rows = []
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise SystemExit(
+                f"测试追踪缺少列：{', '.join(sorted(missing))}"
+            )
+        for row_number, row in enumerate(reader, start=2):
+            keys = [
+                "episode",
+                "mean_score",
+                "mean_survival_steps",
+                "top_out_rate",
+            ]
+            keys.extend(
+                f"{prefix}{i}"
+                for i in range(6)
+                for prefix in ("feature", "weight", "contribution")
+            )
+            values = {
+                key: parse_number(row, key, row_number) for key in keys
+            }
+            rows.append(values)
+    if not rows:
+        raise SystemExit(f"测试追踪中没有数据：{path}")
+    return rows
+
+
+def plot_evaluation(path, rows, window, output_path):
+    episodes = [row["episode"] for row in rows]
+    figure, axes = plt.subplots(3, 2, figsize=(16, 13), constrained_layout=True)
+    figure.suptitle(f"独立测试集评估：{path.name}")
+
+    axes[0, 0].plot(
+        episodes,
+        [row["mean_score"] for row in rows],
+        marker="o",
+        color="#1769aa",
+        label="平均得分",
+    )
+    axes[0, 0].set_title("测试集平均得分")
+    axes[0, 0].set_xlabel("训练局数（0 表示训练前）")
+    axes[0, 0].set_ylabel("平均得分")
+    axes[0, 0].legend(fontsize=8)
+    axes[0, 0].grid(alpha=0.25)
+
+    axes[0, 1].plot(
+        episodes,
+        [row["mean_survival_steps"] for row in rows],
+        marker="s",
+        color="#e67e22",
+        label="平均存活步数",
+    )
+    axes[0, 1].set_title("测试集平均存活步数")
+    axes[0, 1].set_xlabel("训练局数")
+    axes[0, 1].set_ylabel("步数（每段最多 500）")
+    axes[0, 1].legend(fontsize=8)
+    axes[0, 1].grid(alpha=0.25)
+
+    axes[1, 0].plot(
+        episodes,
+        [row["top_out_rate"] for row in rows],
+        marker="o",
+        color="#c62828",
+        label="顶出率",
+    )
+    axes[1, 0].set_title("测试集顶出率")
+    axes[1, 0].set_xlabel("训练局数")
+    axes[1, 0].set_ylabel("顶出率（%）")
+    axes[1, 0].legend(fontsize=8)
+    axes[1, 0].grid(alpha=0.25)
+
+    for index, name in enumerate(WEIGHT_NAMES):
+        axes[1, 1].plot(
+            episodes,
+            [row[f"weight{index}"] for row in rows],
+            marker="o",
+            label=name,
         )
-    print(f"Plot: {output_path}")
+    axes[1, 1].set_title("测试采样时的参数")
+    axes[1, 1].set_xlabel("训练局数")
+    axes[1, 1].set_ylabel("权重")
+    axes[1, 1].set_yscale("symlog", linthresh=1)
+    axes[1, 1].legend(ncol=2, fontsize=8)
+    axes[1, 1].grid(alpha=0.25)
+
+    for index, name in enumerate(FEATURE_NAMES):
+        values = rolling_mean(
+            [row[f"feature{index}"] for row in rows], window
+        )
+        axes[2, 0].plot(episodes, values, marker="o", label=name)
+    axes[2, 0].set_title("测试集归一化特征均值")
+    axes[2, 0].set_xlabel("训练局数")
+    axes[2, 0].set_ylabel("归一化特征值")
+    axes[2, 0].legend(ncol=2, fontsize=8)
+    axes[2, 0].grid(alpha=0.25)
+
+    for index, name in enumerate(FEATURE_NAMES):
+        values = rolling_mean(
+            [row[f"contribution{index}"] for row in rows], window
+        )
+        axes[2, 1].plot(episodes, values, marker="o", label=name)
+    axes[2, 1].axhline(0, color="black", linewidth=0.7, alpha=0.6)
+    axes[2, 1].set_title("测试集加权特征贡献")
+    axes[2, 1].set_xlabel("训练局数")
+    axes[2, 1].set_ylabel("平均价值贡献")
+    axes[2, 1].legend(ncol=2, fontsize=8)
+    axes[2, 1].grid(alpha=0.25)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="用中文图表分析俄罗斯方块线性 DQN 的训练与测试追踪。"
+    )
+    parser.add_argument("trace", nargs="?", default="training_trace.csv")
+    parser.add_argument(
+        "--eval-trace",
+        help="训练中周期测试生成的 CSV（由程序 --eval-trace 参数输出）。",
+    )
+    parser.add_argument(
+        "--output",
+        default="training_analysis.png",
+        help="训练图输出文件。",
+    )
+    parser.add_argument(
+        "--eval-output",
+        help="测试图输出文件；默认在训练图文件名后添加 _测试集。",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=25,
+        help="滚动平均窗口大小，单位为训练局或测试采样点。",
+    )
+    args = parser.parse_args()
+
+    if args.window < 1:
+        parser.error("--window 必须大于零")
+    trace_path = Path(args.trace)
+    if not trace_path.is_file():
+        raise SystemExit(f"找不到训练追踪文件：{trace_path}")
+    evaluation_path = Path(args.eval_trace) if args.eval_trace else None
+    if evaluation_path and not evaluation_path.is_file():
+        raise SystemExit(f"找不到测试追踪文件：{evaluation_path}")
+
+    prepare_matplotlib()
+    episodes, rows = load_training_trace(trace_path)
+    output_path = Path(args.output)
+    plot_training(
+        trace_path, episodes, rows, args.window, output_path
+    )
+    episode_ids = sorted(episodes)
+    print(f"训练图：{output_path}")
+    print(f"训练局数：{len(episode_ids)}；动作数：{rows:,}")
+    print(
+        f"平均每局得分："
+        f"{sum(episodes[e]['score'] for e in episode_ids) / len(episode_ids):.3f}"
+    )
+    print(
+        f"平均存活步数："
+        f"{sum(episodes[e]['steps'] for e in episode_ids) / len(episode_ids):.3f}"
+    )
+
+    if evaluation_path:
+        eval_output = (
+            Path(args.eval_output)
+            if args.eval_output
+            else output_path.with_name(
+                f"{output_path.stem}_测试集{output_path.suffix or '.png'}"
+            )
+        )
+        evaluations = load_evaluation_trace(evaluation_path)
+        plot_evaluation(
+            evaluation_path, evaluations, args.window, eval_output
+        )
+        print(f"测试图：{eval_output}")
+        for row in evaluations:
+            print(
+                f"  训练至 {int(row['episode']):>5} 局："
+                f"测试均分 {row['mean_score']:.2f}，"
+                f"存活 {row['mean_survival_steps']:.2f} 步，"
+                f"顶出率 {row['top_out_rate']:.1f}%"
+            )
 
 
 if __name__ == "__main__":

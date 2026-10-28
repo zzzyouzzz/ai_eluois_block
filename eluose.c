@@ -344,10 +344,21 @@ static int save_value_model(const char *path){
 static int write_training_trace_header(FILE *trace){
     if(fprintf(trace,
                "episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,"
-               "current_value,next_value,target,td_error,feature_norm")<0)return 0;
+               "current_value,next_value,target,td_error,feature_norm,board_cells")<0)return 0;
     for(int i=0;i<FEATURE_COUNT;i++){
         if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
                    i,i,i,i,i)<0)return 0;
+    }
+    return fprintf(trace,"\n")>=0;
+}
+
+static int write_evaluation_trace_header(FILE *trace){
+    if(fprintf(trace,
+               "episode,games,mean_score,mean_survival_steps,top_out_rate")<0)
+        return 0;
+    for(int i=0;i<FEATURE_COUNT;i++){
+        if(fprintf(trace,",feature%d,weight%d,contribution%d",i,i,i)<0)
+            return 0;
     }
     return fprintf(trace,"\n")>=0;
 }
@@ -357,15 +368,16 @@ static int record_training_data(FILE *trace,int episode,unsigned long long turn,
                                 int score,double reward,int terminal,
                                 double current_value,double next_value,
                                 double target,double delta,double norm,
+                                int board_cells,
                                 const double before[FEATURE_COUNT],
                                 const double updates[FEATURE_COUNT],
                                 const double after[FEATURE_COUNT]){
     if(!trace)return 1;
     if(fprintf(trace,"%d,%llu,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
-                     "%.17g,%.17g,%.17g,%.17g,%.17g",
+                     "%.17g,%.17g,%.17g,%.17g,%.17g,%d",
                episode,turn,shape,action->rotation,action->x,action->y,
                epsilon,score,reward,terminal,current_value,next_value,
-               target,delta,norm)<0){
+               target,delta,norm,board_cells)<0){
         fprintf(stderr,"写入训练追踪文件失败\n");
         return 0;
     }
@@ -394,6 +406,8 @@ static int record_training_data(FILE *trace,int episode,unsigned long long turn,
 #define DQN_GAMMA 0.99
 #define DQN_LEARNING_RATE 0.0001
 #define EVALUATION_EPISODES 100
+#define EVALUATION_SAMPLE_COUNT 20
+#define EVALUATION_MAX_STEPS 500
 
 typedef struct{
     training_action action;
@@ -475,7 +489,8 @@ static void add_replay_transition(const replay_transition *transition){
 static int train_on_transition(FILE *trace,int episode,
                                unsigned long long turn,int shape,
                                const training_action *action,double epsilon,
-                               int score,const replay_transition *transition){
+                               int score,int board_cells,
+                               const replay_transition *transition){
     double current_value=action->value;
     double next_value=transition->terminal?0.0:
         score_features(target_weights,transition->next_features);
@@ -511,6 +526,7 @@ static int train_on_transition(FILE *trace,int episode,
     return record_training_data(trace,episode,turn,shape,action,epsilon,score,
                                 transition->reward,transition->terminal,
                                 current_value,next_value,target,td_error,norm,
+                                board_cells,
                                 before,updates,after);
 }
 
@@ -541,6 +557,10 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
             return 0;
         }
         clear_lines(full_rows,fill_line);
+        int board_cells=0;
+        for(int row=0;row<20;row++)
+            for(int column=0;column<10;column++)
+                board_cells+=board[row][column]!=0;
 
         int terminal=action.top_out;
         double reward=score+1.0;
@@ -571,7 +591,7 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
         transition.terminal=terminal;
 
         if(!train_on_transition(trace,episode,turn,shape,&action,epsilon,
-                                score,&transition))
+                                score,board_cells,&transition))
             return 0;
         *episode_score+=score;
         *survival_steps=(int)turn;
@@ -582,8 +602,12 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
     return 1;
 }
 
+static int evaluate_value_model(const char *path,const char *label,
+                                int sample_count,FILE *trace,int episode);
+
 static int train_value_model(int episodes,const char *input_path,FILE *trace,
-                             int *completed_episodes){
+                             int *completed_episodes,const char *test_path,
+                             FILE *evaluation_trace,int evaluation_interval){
     srand((unsigned int)time(NULL));
     memcpy(target_weights,value_weights,sizeof(target_weights));
     replay_size=0;
@@ -616,6 +640,13 @@ static int train_value_model(int episodes,const char *input_path,FILE *trace,
         if(!success)return 0;
         if(!has_training_data)break;
         (*completed_episodes)++;
+        if(test_path&&evaluation_trace&&
+           *completed_episodes%evaluation_interval==0&&
+           *completed_episodes<episodes&&
+           !evaluate_value_model(test_path,"周期测试",
+                                 EVALUATION_SAMPLE_COUNT,evaluation_trace,
+                                 *completed_episodes))
+            return 0;
         window_count++;
         window_score+=episode_score;
         window_steps+=survival_steps;
@@ -631,12 +662,24 @@ static int train_value_model(int episodes,const char *input_path,FILE *trace,
     return 1;
 }
 
-static int run_evaluation_episode(FILE *input,int step_limit,int *score,
-                                  int *survival_steps,int *top_out){
+typedef struct{
+    int score;
+    int survival_steps;
+    int top_out;
+    double features[FEATURE_COUNT];
+}evaluation_result;
+
+static double normalize_feature(int feature_index,double value,int board_cells){
+    if(feature_index==0)return value/20.0;
+    if(feature_index==1)return value/4.0;
+    if(board_cells<4)board_cells=4;
+    return value/board_cells;
+}
+
+static int run_evaluation_episode(FILE *input,int step_limit,
+                                  evaluation_result *result){
     memset(board,0,sizeof(board));
-    *score=0;
-    *survival_steps=0;
-    *top_out=0;
+    memset(result,0,sizeof(*result));
     int shape=get_block(input);
     while(shape>=0&&shape<7){
         training_action action=generate_action(shape,0.0,value_weights);
@@ -653,19 +696,31 @@ static int run_evaluation_episode(FILE *input,int step_limit,int *score,
             return 0;
         }
         clear_lines(full_rows,fill_line);
-        *score+=block_score;
-        (*survival_steps)++;
+        result->score+=block_score;
+        result->survival_steps++;
+        int board_cells=0;
+        for(int row=0;row<20;row++)
+            for(int column=0;column<10;column++)
+                board_cells+=board[row][column]!=0;
+        for(int i=0;i<FEATURE_COUNT;i++)
+            result->features[i]+=
+                normalize_feature(i,action.features[i],board_cells);
         if(action.top_out){
-            *top_out=1;
+            result->top_out=1;
             break;
         }
-        if(*survival_steps>=step_limit)break;
+        if(result->survival_steps>=step_limit)break;
         shape=get_block(input);
     }
     return 1;
 }
 
-static int evaluate_value_model(const char *path,const char *label){
+static int evaluate_value_model(const char *path,const char *label,
+                                int sample_count,FILE *trace,int episode){
+    if(sample_count<1){
+        fprintf(stderr,"测试采样局数必须大于零\n");
+        return 0;
+    }
     FILE *input=fopen(path,"r");
     if(!input){
         fprintf(stderr,"无法打开测试输入文件 %s\n",path);
@@ -682,40 +737,70 @@ static int evaluate_value_model(const char *path,const char *label){
         fclose(input);
         return 0;
     }
+    if(file_size<sample_count)sample_count=(int)file_size;
 
     double total_score=0.0,total_steps=0.0;
     int total_top_out=0;
-    for(int episode=0;episode<EVALUATION_EPISODES;episode++){
-        long segment_size=file_size/EVALUATION_EPISODES+
-            (episode<file_size%EVALUATION_EPISODES);
-        long offset=(file_size/EVALUATION_EPISODES)*episode+
-            (file_size%EVALUATION_EPISODES<episode?
-             file_size%EVALUATION_EPISODES:episode);
+    double total_features[FEATURE_COUNT]={0.0};
+    for(int sample=0;sample<sample_count;sample++){
+        long segment_size=file_size/sample_count+
+            (sample<file_size%sample_count);
+        long offset=(file_size/sample_count)*sample+
+            (file_size%sample_count<sample?
+             file_size%sample_count:sample);
         if(fseek(input,offset,SEEK_SET)!=0){
             fprintf(stderr,"无法定位测试输入文件 %s\n",path);
             fclose(input);
             return 0;
         }
-        int score=0,survival_steps=0,top_out=0;
-        if(!run_evaluation_episode(input,(int)segment_size,&score,
-                                   &survival_steps,&top_out)){
+        evaluation_result result;
+        int step_limit=segment_size>EVALUATION_MAX_STEPS?
+            EVALUATION_MAX_STEPS:(int)segment_size;
+        if(!run_evaluation_episode(input,step_limit,&result)){
             fclose(input);
             return 0;
         }
-        total_score+=score;
-        total_steps+=survival_steps;
-        total_top_out+=top_out;
+        total_score+=result.score;
+        total_steps+=result.survival_steps;
+        total_top_out+=result.top_out;
+        for(int i=0;i<FEATURE_COUNT;i++)
+            total_features[i]+=result.features[i];
     }
     if(fclose(input)!=0){
         fprintf(stderr,"关闭测试输入文件失败：%s\n",path);
         return 0;
     }
+    if(total_steps==0.0){
+        fprintf(stderr,"测试输入中没有可用方块：%s\n",path);
+        return 0;
+    }
 
+    double mean_score=total_score/sample_count;
+    double mean_steps=total_steps/sample_count;
+    double top_out_rate=100.0*total_top_out/sample_count;
+    double mean_features[FEATURE_COUNT];
+    for(int i=0;i<FEATURE_COUNT;i++)
+        mean_features[i]=total_features[i]/total_steps;
     printf("%s（%d 局，%s）：平均得分 %.2f，平均存活步数 %.2f，顶出率 %.1f%%\n",
-           label,EVALUATION_EPISODES,path,
-           total_score/EVALUATION_EPISODES,
-           total_steps/EVALUATION_EPISODES,
-           100.0*total_top_out/EVALUATION_EPISODES);
+           label,sample_count,path,mean_score,mean_steps,top_out_rate);
+    if(trace){
+        if(fprintf(trace,"%d,%d,%.17g,%.17g,%.17g",
+                   episode,sample_count,mean_score,mean_steps,top_out_rate)<0){
+            fprintf(stderr,"写入测试追踪文件失败\n");
+            return 0;
+        }
+        for(int i=0;i<FEATURE_COUNT;i++){
+            if(fprintf(trace,",%.17g,%.17g,%.17g",mean_features[i],
+                       value_weights[i],mean_features[i]*value_weights[i])<0){
+                fprintf(stderr,"写入测试追踪文件失败\n");
+                return 0;
+            }
+        }
+        if(fprintf(trace,"\n")<0){
+            fprintf(stderr,"写入测试追踪文件失败\n");
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -761,10 +846,12 @@ static int run_game(FILE *input){
 
 int main(int argc,char **argv){
     long episodes=2000;
-    int training=0,fresh_model=0;
+    long evaluation_interval=100;
+    int training=0,fresh_model=0,evaluation_interval_set=0;
     const char *input_path=NULL;
     const char *test_path=NULL;
     const char *trace_path=NULL;
+    const char *evaluation_trace_path=NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--train")==0){
             if(training){
@@ -811,10 +898,33 @@ int main(int argc,char **argv){
                 return 1;
             }
             trace_path=argv[++i];
+        }else if(strcmp(argv[i],"--eval-trace")==0){
+            if(evaluation_trace_path||i+1>=argc||argv[i+1][0]=='\0'){
+                fprintf(stderr,"--eval-trace 后必须指定测试追踪文件，且只能指定一次\n");
+                return 1;
+            }
+            evaluation_trace_path=argv[++i];
+        }else if(strcmp(argv[i],"--eval-interval")==0){
+            if(evaluation_interval_set||i+1>=argc||argv[i+1][0]=='\0'){
+                fprintf(stderr,"--eval-interval 后必须指定正整数\n");
+                return 1;
+            }
+            char *end=NULL;
+            errno=0;
+            long parsed=strtol(argv[++i],&end,10);
+            if(errno||end==argv[i]||*end!='\0'||parsed<1||
+               parsed>1000000){
+                fprintf(stderr,"测试间隔必须是 1 到 1000000 之间的整数\n");
+                return 1;
+            }
+            evaluation_interval=parsed;
+            evaluation_interval_set=1;
         }else{
             fprintf(stderr,
                     "用法：%s [--train [局数]] [-i 训练/对局输入文件] "
-                    "[--test 测试输入文件] [--fresh] [--trace 追踪文件]\n",
+                    "[--test 测试输入文件] [--fresh] [--trace 追踪文件] "
+                    "[--eval-trace 测试追踪文件] "
+                    "[--eval-interval 局数]\n",
                     argv[0]);
             return 1;
         }
@@ -829,6 +939,24 @@ int main(int argc,char **argv){
     }
     if(trace_path&&strcmp(trace_path,"q_weights.dat")==0){
         fprintf(stderr,"追踪文件不能覆盖 q_weights.dat\n");
+        return 1;
+    }
+    if(evaluation_trace_path&&
+       (!training||!test_path||
+        strcmp(evaluation_trace_path,"q_weights.dat")==0||
+        (trace_path&&strcmp(evaluation_trace_path,trace_path)==0)||
+        (input_path&&strcmp(evaluation_trace_path,input_path)==0)||
+        strcmp(evaluation_trace_path,test_path)==0)){
+        fprintf(stderr,
+                "--eval-trace 仅能用于训练，且必须与其他输入/输出文件不同\n");
+        return 1;
+    }
+    if(evaluation_interval_set&&!evaluation_trace_path){
+        fprintf(stderr,"--eval-interval 必须与 --eval-trace 一起使用\n");
+        return 1;
+    }
+    if(evaluation_trace_path&&!test_path){
+        fprintf(stderr,"--eval-trace 需要同时指定 --test 测试文件\n");
         return 1;
     }
     if(training&&episodes>1&&
@@ -863,16 +991,13 @@ int main(int argc,char **argv){
     }
 
     if(test_path&&!training){
-        return evaluate_value_model(test_path,"测试")?0:1;
+        return evaluate_value_model(test_path,"测试",EVALUATION_EPISODES,
+                                   NULL,0)?0:1;
     }
 
     if(training){
-        if(test_path&&
-           !evaluate_value_model(test_path,"训练前测试")){
-            if(input!=stdin)fclose(input);
-            return 1;
-        }
         FILE *trace=NULL;
+        FILE *evaluation_trace=NULL;
         if(trace_path){
             trace=fopen(trace_path,"w");
             if(!trace){
@@ -885,13 +1010,53 @@ int main(int argc,char **argv){
                 return 1;
             }
         }
-        int completed_episodes=0;
-        if(!train_value_model((int)episodes,input_path,trace,&completed_episodes)){
+        if(evaluation_trace_path){
+            evaluation_trace=fopen(evaluation_trace_path,"w");
+            if(!evaluation_trace){
+                fprintf(stderr,"无法创建测试追踪文件 %s\n",
+                        evaluation_trace_path);
+                if(trace)fclose(trace);
+                return 1;
+            }
+            if(!write_evaluation_trace_header(evaluation_trace)){
+                fprintf(stderr,"无法写入测试追踪文件表头 %s\n",
+                        evaluation_trace_path);
+                fclose(evaluation_trace);
+                if(trace)fclose(trace);
+                return 1;
+            }
+        }
+        if(test_path&&
+           !evaluate_value_model(test_path,"训练前测试",EVALUATION_EPISODES,
+                                 evaluation_trace,0)){
             if(trace)fclose(trace);
+            if(evaluation_trace)fclose(evaluation_trace);
+            return 1;
+        }
+        int completed_episodes=0;
+        if(!train_value_model((int)episodes,input_path,trace,&completed_episodes,
+                              test_path,evaluation_trace,
+                              (int)evaluation_interval)){
+            if(trace)fclose(trace);
+            if(evaluation_trace)fclose(evaluation_trace);
+            return 1;
+        }
+        if(evaluation_trace&&completed_episodes>0&&
+           !evaluate_value_model(test_path,"训练后测试",
+                                 EVALUATION_EPISODES,evaluation_trace,
+                                 completed_episodes)){
+            if(trace)fclose(trace);
+            fclose(evaluation_trace);
             return 1;
         }
         if(trace&&fclose(trace)!=0){
             fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
+            if(evaluation_trace)fclose(evaluation_trace);
+            return 1;
+        }
+        if(evaluation_trace&&fclose(evaluation_trace)!=0){
+            fprintf(stderr,"关闭测试追踪文件失败：%s\n",
+                    evaluation_trace_path);
             return 1;
         }
         if(completed_episodes==0){
@@ -903,7 +1068,11 @@ int main(int argc,char **argv){
                completed_episodes);
         for(int i=0;i<FEATURE_COUNT;i++)
             printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
-        if(test_path&&!evaluate_value_model(test_path,"训练后测试"))return 1;
+        if(test_path&&!evaluation_trace_path&&
+           !evaluate_value_model(test_path,"训练后测试",
+                                 EVALUATION_EPISODES,NULL,
+                                 completed_episodes))
+            return 1;
         return 0;
     }
 

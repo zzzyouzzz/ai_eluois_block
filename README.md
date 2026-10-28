@@ -362,7 +362,7 @@ static int save_value_model(const char *path){
 `--trace` 为每个环境动作记录一行。前 15 列为：
 
 ```text
-episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next_value,target,td_error,feature_norm
+episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next_value,target,td_error,feature_norm,board_cells
 ```
 
 之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列。因为训练采用经验回放，一行表示一次实际环境动作；权重变化列记录此动作加入回放后执行的批量更新，不代表单独由该行特征产生的更新。
@@ -392,7 +392,7 @@ target = reward + 0.99 * Q_target(next)  (otherwise)
 
 奖励为实际消行分数加每步 `1` 分存活奖励；顶出时再扣除 `300 * exp(-(turn - 1) / 60)`，使越早结束的局受到越重惩罚。有限输入耗尽视为截断终局，不额外施加顶出惩罚。批量更新使用截断在 `[-100, 100]` 的 TD 梯度和特征范数归一化，以降低大 TD 误差导致权重骤变的风险。
 
-训练局数区间的平均得分与平均存活步数每 100 局输出一次。`--test` 会在训练前后将测试文件分成 100 个不重叠片段，对每段运行贪心策略，报告平均得分、存活步数和顶出率；每局最多使用该片段的方块数。不指定 `--train` 时，它也可单独评估当前模型。
+训练局数区间的平均得分与平均存活步数每 100 局输出一次。`--test` 会在训练前后将测试文件分成 100 个不重叠片段，对每段运行贪心策略，报告平均得分、存活步数和顶出率；每段最多运行 500 步。不指定 `--train` 时，它也可单独评估当前模型。
 
 ### 2.10 命令行参数
 
@@ -401,6 +401,8 @@ target = reward + 0.99 * Q_target(next)  (otherwise)
 - `--train [局数]` 启用训练；局数可省略（默认 2000），范围为 1 到 1,000,000。
 - `-i 方块输入文件` 在训练和正常运行模式中指定方块序列；正常模式省略时使用 `stdin`，`-i -` 也表示 `stdin`。
 - `--test 测试文件` 训练时比较训练前后的贪心表现；不带 `--train` 时单独评估当前模型。建议测试集与 `-i` 训练集分离。
+- `--eval-trace CSV文件` 将训练前、训练中周期评估及训练后的测试结果写入独立 CSV；需要同时指定 `--test`。
+- `--eval-interval 局数` 设置周期测试频率，默认每 100 局；每次中途采样 20 个测试片段，训练前/后使用 100 个片段。
 - `--fresh` 训练时忽略已有 `q_weights.dat`，从源码中的初始 6 个权重开始；适合从旧版训练流程切换到 DQN 时使用。
 - `--trace CSV文件` 可选，仅用于训练模式，记录每步训练数据。
 - 参数顺序不限，例如 `eluose.exe -i .\1.txt --train 1000` 与 `eluose.exe --train 1000 -i .\1.txt` 等价。
@@ -433,6 +435,15 @@ Get-Content .\1.txt | .\eluose.exe --train 1
 .\eluose.exe --train 1000 --fresh -i .\1.txt --test .\2.txt
 ```
 
+保存训练期间的独立测试曲线（每 100 局评估一次）：
+
+```powershell
+.\eluose.exe --train 1000 --fresh -i .\1.txt --test .\2.txt `
+  --trace .\training_trace.csv --eval-trace .\evaluation_trace.csv
+```
+
+周期评估间隔可通过 `--eval-interval 50` 等方式调整。
+
 只评估当前模型：
 
 ```powershell
@@ -445,16 +456,19 @@ Get-Content .\1.txt | .\eluose.exe --train 1
 .\eluose.exe --train 1000 --trace .\training_trace.csv -i .\1.txt
 ```
 
-每轮训练都会重开 `-i` 指定的文件并从头读取，棋盘顶出或文件结束时本轮结束；训练轮数由 `--train` 指定。动作探索仍使用 epsilon-greedy 随机策略。多轮训练不能使用 `stdin`，因为输入流不能重新打开；单轮训练可省略 `-i` 或使用 `-i -`。使用 `--test` 时，测试策略始终为贪心，不进行探索。
+每轮训练都会重开 `-i` 指定的文件并从头读取，棋盘顶出或文件结束时本轮结束；训练轮数由 `--train` 指定。动作探索仍使用 epsilon-greedy 随机策略。多轮训练不能使用 `stdin`，因为输入流不能重新打开；单轮训练可省略 `-i` 或使用 `-i -`。使用 `--test` 时，测试策略始终为贪心，不进行探索。`--eval-trace` 会记录训练前、每隔指定局数（每个检查点 20 个片段）以及训练后的测试结果，供脚本绘制独立测试曲线。
 
 CSV 可用 Excel 导入，也可用 Python、R 等工具统计。重点比较 `featureN`、`weight_beforeN`、`contributionN`、`weight_deltaN` 和 `weight_afterN`，同时观察 `td_error` 与 `feature_norm`。例如，若某维 `weight_deltaN` 长期同号且绝对值持续增大，说明该维在持续推动权重漂移；若 `td_error` 很大而多维特征同时非零，需结合每维的 `weight_deltaN` 判断具体贡献。
 
-仓库中的 [`analyze_training.py`](./analyze_training.py) 可将追踪数据汇总并绘制训练得分、权重轨迹、每步权重变化和各特征量级。需要 Python 与 `matplotlib`：
+仓库中的 [`analyze_training.py`](./analyze_training.py) 会绘制中文训练图（滚动平均得分/存活步数、epsilon、六个权重、归一化特征、加权特征贡献、消行率和 TD 误差）；提供测试追踪时还会生成测试集得分/存活、权重、特征及加权贡献图。高度按棋盘高度归一化，消行特征按 4 格归一化，行变化、列变化、洞数和井深按落子后棋盘方块总数归一化，减少不同堆叠规模造成的量级偏差。加权贡献为 `weight_before × 归一化特征`，可观察权重变化是否伴随该特征对应贡献或特征值下降。脚本要求使用当前 DQN 版本生成的追踪 CSV；追踪格式不匹配时会报告缺失字段。旧版追踪文件需重新训练后再分析。需要 Python 与 `matplotlib`：
 
 ```powershell
 python -m pip install matplotlib
-python .\analyze_training.py .\training_trace.csv --output .\training_analysis.png
+python .\analyze_training.py .\training_trace.csv `
+  --eval-trace .\evaluation_trace.csv --output .\training_analysis.png
 ```
+
+脚本会额外生成 `training_analysis_测试集.png`；可用 `--window 50` 调整滚动均值窗口，也可用 `--eval-output` 指定测试图文件名。
 
 训练默认会在**当前工作目录**读取已有的 `q_weights.dat`（若存在）并保存训练后的模型。切换旧版训练流程时，建议使用 `--fresh` 从源码默认权重开始；若希望继续 DQN 训练，则不要加此参数。训练会覆盖 `q_weights.dat`，实验前请先备份。
 如果模型文件中已有 `nan`，程序会拒绝加载。先备份并移走该文件，再开始训练，例如：
