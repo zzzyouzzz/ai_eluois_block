@@ -1,4 +1,4 @@
-# 俄罗斯方块价值函数与 Q-learning 训练说明
+# 俄罗斯方块线性 DQN 训练说明
 
 本文对应源文件 [`eluose.c`](./eluose.c)，重点说明其中用于训练棋盘价值函数的代码。代码使用 C 语言实现俄罗斯方块落子、棋盘特征提取和一个线性函数近似器。
 
@@ -20,7 +20,7 @@
 
 智能体执行动作后，棋盘发生变化，得到下一个状态。训练的目标不是只挑眼前看起来最好的落点，而是让当前选择也考虑后续可能得到的回报。
 
-### 1.2 Q 值、折扣回报和 TD 更新
+### 1.2 DQN 目标与经验回放
 
 `Q(s, a)` 表示在状态 `s` 下执行动作 `a` 后，未来累计回报的估计。未来回报通常按折扣率 `gamma` 衰减：
 
@@ -37,7 +37,7 @@ delta  = target - Q(state, action)
 
 `delta` 称为 TD 误差，表示当前估值与新目标之间的差距。若游戏已经结束，则没有后继价值，目标只包含即时奖励。
 
-训练代码通过编译宏 `TD_N` 控制 n-step TD 的步数，默认值为 `1`（例如编译时使用 `-DTD_N=3`）。训练会逐步执行后续落子并暂存转移；队列达到 N 步时，按实际队列长度计算折扣奖励和后继状态价值，并更新队列中的每条转移。游戏结束或输入耗尽时，用 bootstrap 为零更新剩余转移。
+程序使用一步 DQN 目标，并把转移放入有限大小的经验回放区，随机抽取小批次训练。目标权重每隔一段更新步数才从在线权重复制一次，以降低目标快速漂移。批量更新使用 Huber TD 梯度和特征范数归一化；终局转移不 bootstrap。超参数在源码的 `DQN_*` 常量中设置。
 
 ### 1.3 本程序的线性函数近似
 
@@ -47,7 +47,7 @@ delta  = target - Q(state, action)
 Q(s, a) ≈ w₀φ₀ + w₁φ₁ + ... + w₅φ₅
 ```
 
-代码中的 `features` 是特征向量 `φ`，`value_weights` 是权重 `w`。每次训练通过 TD 误差调整权重。因而它是**线性函数近似的 Q-learning 风格实现**，不是保存状态—动作表格的 tabular Q-learning，也不是神经网络。
+代码中的 `features` 是特征向量 `φ`，`value_weights` 是权重 `w`。当前仍是 6 个输入、单个线性输出的动作价值模型；DQN 的经验回放和目标权重机制不改变 `q_weights.dat` 的六个参数格式。
 
 特征描述的是“把当前方块放到某个位置后”的棋盘：
 
@@ -55,10 +55,10 @@ Q(s, a) ≈ w₀φ₀ + w₁φ₁ + ... + w₅φ₅
 | --- | --- | --- |
 | `0` | 落点高度 | `y + block_height - 1` |
 | `1` | 消行特征 | 完成行数乘以当前方块落在这些完成行中的格子数 |
-| `2` | 行方向变化 `drow` | 相邻列在同一行上的占用状态差异计数 |
-| `3` | 列方向变化 `dcol` | 同一列相邻行上的占用状态差异计数 |
-| `4` | 洞数 `holes` | 某格为空但其上方已出现方块时的计数 |
-| `5` | 井深 `well` | 左右两侧被占据而本格为空时累计的井深 |
+| `2` | 行方向变化 `drow` | 清除满行后的棋盘上，相邻列在同一行的占用状态差异计数 |
+| `3` | 列方向变化 `dcol` | 清除满行后的棋盘上，同一列相邻行的占用状态差异计数 |
+| `4` | 洞数 `holes` | 清除满行后的棋盘上，某格为空但其上方已出现方块时的计数 |
+| `5` | 井深 `well` | 清除满行后的棋盘上，左右两侧被占据而本格为空时累计的井深 |
 
 初始权重为 `{-45, 34, -32, -93, -79, -34}`，是原先启发式评估系数的起点。训练后权重会变化；每个特征对局面好坏的影响由训练结果决定。
 
@@ -359,149 +359,40 @@ static int save_value_model(const char *path){
 
 ### 2.8 训练追踪表头 `write_training_trace_header`
 
-训练函数可选接收一个 CSV 文件指针。启用追踪后，程序先写表头。前 15 列为：
+`--trace` 为每个环境动作记录一行。前 15 列为：
 
 ```text
 episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next_value,target,td_error,feature_norm
 ```
 
-之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列，例如特征 0。`record_training_data` 独立负责写入一条完整更新记录；不启用追踪时不会写 CSV：
+之后每个特征 `i` 都会追加 `feature_i,weight_before_i,contribution_i,weight_delta_i,weight_after_i` 五列。因为训练采用经验回放，一行表示一次实际环境动作；权重变化列记录此动作加入回放后执行的批量更新，不代表单独由该行特征产生的更新。
 
 | 列 | 含义 |
 | --- | --- |
 | `feature0` | 本次动作的特征值 `φ₀` |
 | `weight_before0` | 更新前权重 `w₀` |
 | `contribution0` | 该特征对当前估值的贡献 `w₀ × φ₀` |
-| `weight_delta0` | 本次权重变化 `Δw₀` |
+| `weight_delta0` | 本次批量更新的权重变化 `Δw₀` |
 | `weight_after0` | 更新后权重 |
 
-特征 1 到 5 同样记录。由此可以区分权重变化是由较大的 TD 误差、该特征的取值，还是它们的乘积造成。每行对应一次训练更新。
+特征 1 到 5 同样记录。`td_error` 是动作写入回放时计算的误差；后续重放会再次更新同一经验，因此 CSV 并非完整的逐次采样批次日志。
 
 `shape` 是方块编号：0=I、1=T、2=O、3=J、4=L、5=S、6=Z。
 
 ### 2.9 核心训练函数 `train_value_model`
 
-```c
-const double alpha=0.01,gamma=0.90;
-srand((unsigned int)time(NULL));
-```
+训练开始时将当前 6 个权重复制到目标权重，并清空最多 50,000 条经验的回放区。每步按 epsilon-greedy 选择动作，执行落子和消行后保存 `features`、奖励、终局标志及下一方块的贪心动作特征。回放区达到 64 条经验后，每步随机抽取 32 条进行更新；每 500 次批量更新同步一次目标权重，学习率为 `0.0001`。
 
-- `alpha` 是学习率，控制每次权重更新的幅度。较大时学习快但可能不稳定，较小时更新平缓。
-- `gamma` 是未来价值折扣率。程序用它折扣后续 N 步奖励和 bootstrap 价值。
-- `srand` 使用当前时间初始化伪随机数生成器，用于 epsilon-greedy 动作探索。训练方块不再随机生成，而是按输入序列调用 `get_block` 读取。
-
-#### 开始每一局并清空棋盘（第 335–337 行）
-
-```c
-for(int episode=0;episode<episodes;episode++){
-    for(int i=0;i<25;i++)
-        for(int j=0;j<15;j++)board[i][j]=0;
-```
-
-- 外层循环训练指定局数。
-- 每局开始时清空整个 `board[25][15]` 数组，保证上一局状态不会泄漏到新一局。
-
-#### 设置探索概率并读取起始方块
-
-```c
-double epsilon=0.25-0.20*(double)episode/episodes;
-if(epsilon<0.05)epsilon=0.05;
-int shape=get_block(block_input);
-```
-
-- `epsilon` 从约 `0.25` 随训练进度线性下降到 `0.05`。
-- 最低值限制为 `0.05`，保留少量探索。
-- `get_block` 从本轮训练输入流按原顺序读取方块。棋盘顶出或输入结束时结束本轮。
-- 每轮都重新打开输入文件，因此下一轮会从文件开头开始；只有空文件或没有可训练动作时才会提前停止训练。
-
-#### 单局读取边界
-
-```c
-for(unsigned long long turn=1;;turn++){
-```
-
-单局没有固定回合数上限；当前局持续读取方块，直到棋盘顶出、无合法动作或输入序列结束。训练外层每轮重新打开输入文件，因此下一局会从同一序列开头重新训练。
-
-#### 获取可选动作和 epsilon-greedy 选择（第 342–353 行）
-
-```c
-training_action action=generate_action(shape,epsilon,value_weights);
-if(!action.valid)return 1;
-```
-
-- 动作生成函数统一负责枚举落点、提取特征和 epsilon-greedy 选择。
-- 训练显式传入当前权重；正常模式以 `epsilon=0` 调用相同函数。
-- 没有可执行动作时，本局结束。
-
-#### 执行动作和处理消行（第 353–360 行）
-
-```c
-int fill[4],full_rows[4],fill_line;
-int score=place_block(shape,action.rotation,action.x,action.y,
-                      fill,full_rows,&fill_line);
-if(score<0)break;
-clear_lines(full_rows,fill_line);
-```
-
-- 复制选中动作，保存本次选择时的特征。
-- `place_block` 真正将方块写入棋盘，并计算消行得分。
-- 放置失败时结束本局。
-- `clear_lines` 删除已满行并将上方行下移。这一步是实际环境状态转移的一部分；与特征提取时临时放置后只评估、随后撤销不同。
-
-```c
-int terminal=action.top_out;
-double reward=score-(terminal?200.0:0.0);
-```
-
-- `terminal` 表示本次动作是否达到顶出边界。
-- 消行得分作为正向奖励。
-- 顶出时再减去 `200`，形成终局惩罚。
-
-当前动作及奖励暂存到 `pending` 数组中。未终局时从输入流读取下一个方块，训练循环继续调用 `generate_action` 并实际执行下一次放置，棋盘状态因此随循环推进。
-
-当暂存达到 `TD_N` 步时，以 `generate_action(next_shape,0.0,value_weights)` 得到后继状态的贪心估值，并将队列长度与该估值传给更新函数。更新函数依次为队列中每条转移计算从该位置开始的折扣奖励，并将 bootstrap 按对应步数折扣后加入目标。更新成功后清空队列，继续执行后续动作。`TD_N=1` 时对应一步 TD；增加 `TD_N` 会把多个实际执行动作的折扣奖励纳入每个目标。
-
-若没有安全的后继动作，则追加终局惩罚并结束本局。输入结束、顶出或无合法动作时，循环冲刷尚未更新的转移；终局冲刷只累加剩余的折扣奖励，不使用 bootstrap。
-
-普通 N 步更新与终局冲刷统一调用 `update_training_transitions`，并显式传入当前队列长度和 bootstrap 值。函数始终按队列实际长度计算并更新每条转移：普通更新提供后继价值，终局更新将 bootstrap 设为 `0`。函数不修改队列；调用者在更新成功后清空队列。终局惩罚也由调用者写入最后一条转移的奖励。每条更新都会自动调用 `record_training_data` 保存动作价值、目标、TD 误差及权重更新前后值。
-
-#### 计算 TD 误差并更新权重（第 379–423 行）
-
-```c
-double current_value=transition->action.value;
-double target=discounted_rewards+discounted_bootstrap;
-double delta=target-current_value;
-```
-
-- `current_value` 是动作生成时、权重更新前保存的估值。
-- `target` 是 TD 目标：使用 N 步折扣奖励；未终局时再加折扣后的后继价值。
-- `delta` 是目标减当前估值，即 TD 误差。
-
-```c
-double norm=1.0;
-for(int i=0;i<FEATURE_COUNT;i++)
-    norm+=transition->action.features[i]*transition->action.features[i];
-```
-
-计算特征向量平方范数，并加 `1.0` 避免除零。归一化能降低特征数值较大时单次更新过猛的风险。
-
-程序先计算候选新权重，再统一应用；追踪文件记录每维的更新前后值和变化量。若 TD 值或候选权重不是有限数，训练会报错退出，并且不会保存模型。
-
-逐个更新权重：
+单样本目标为：
 
 ```text
-wᵢ ← wᵢ + alpha * delta * φᵢ / (1 + Σφⱼ²)
+target = reward                         (terminal)
+target = reward + 0.99 * Q_target(next)  (otherwise)
 ```
 
-这相当于对线性估值进行归一化的半梯度 TD 更新。若某特征在当前动作中为零，它对应的权重不会被这一步直接修改。
+奖励为实际消行分数加每步 `1` 分存活奖励；顶出时再扣除 `300 * exp(-(turn - 1) / 60)`，使越早结束的局受到越重惩罚。有限输入耗尽视为截断终局，不额外施加顶出惩罚。批量更新使用截断在 `[-100, 100]` 的 TD 梯度和特征范数归一化，以降低大 TD 误差导致权重骤变的风险。
 
-```c
-if(terminal)break;
-shape=next_shape;
-```
-
-- 顶出时结束当前训练局。
-- 否则将输入序列中的下一个方块设为下一步当前方块，继续训练。
+训练局数区间的平均得分与平均存活步数每 100 局输出一次。`--test` 会在训练前后将测试文件分成 100 个不重叠片段，对每段运行贪心策略，报告平均得分、存活步数和顶出率；每局最多使用该片段的方块数。不指定 `--train` 时，它也可单独评估当前模型。
 
 ### 2.10 命令行参数
 
@@ -509,6 +400,8 @@ shape=next_shape;
 
 - `--train [局数]` 启用训练；局数可省略（默认 2000），范围为 1 到 1,000,000。
 - `-i 方块输入文件` 在训练和正常运行模式中指定方块序列；正常模式省略时使用 `stdin`，`-i -` 也表示 `stdin`。
+- `--test 测试文件` 训练时比较训练前后的贪心表现；不带 `--train` 时单独评估当前模型。建议测试集与 `-i` 训练集分离。
+- `--fresh` 训练时忽略已有 `q_weights.dat`，从源码中的初始 6 个权重开始；适合从旧版训练流程切换到 DQN 时使用。
 - `--trace CSV文件` 可选，仅用于训练模式，记录每步训练数据。
 - 参数顺序不限，例如 `eluose.exe -i .\1.txt --train 1000` 与 `eluose.exe --train 1000 -i .\1.txt` 等价。
 
@@ -519,7 +412,7 @@ shape=next_shape;
 在 Windows PowerShell 中，从仓库目录执行：
 
 ```powershell
-gcc -std=c11 -O2 .\eluose.c -o .\eluose.exe
+gcc -std=c11 -O2 .\eluose.c -lm -o .\eluose.exe
 ```
 
 训练一轮时可以从标准输入读取：
@@ -534,13 +427,25 @@ Get-Content .\1.txt | .\eluose.exe --train 1
 .\eluose.exe --train 10000 -i .\1.txt
 ```
 
+用 `1.txt` 训练，并以独立的 `2.txt` 在训练前后评估 100 个不重叠片段：
+
+```powershell
+.\eluose.exe --train 1000 --fresh -i .\1.txt --test .\2.txt
+```
+
+只评估当前模型：
+
+```powershell
+.\eluose.exe --test .\2.txt
+```
+
 记录每一步特征与权重变化（例如最多训练 1000 局）：
 
 ```powershell
 .\eluose.exe --train 1000 --trace .\training_trace.csv -i .\1.txt
 ```
 
-每轮训练都会重开 `-i` 指定的文件并从头读取，棋盘顶出或文件结束时本轮结束；训练轮数由 `--train` 指定。动作探索仍使用 epsilon-greedy 随机策略。多轮训练不能使用 `stdin`，因为输入流不能重新打开；单轮训练可省略 `-i` 或使用 `-i -`。
+每轮训练都会重开 `-i` 指定的文件并从头读取，棋盘顶出或文件结束时本轮结束；训练轮数由 `--train` 指定。动作探索仍使用 epsilon-greedy 随机策略。多轮训练不能使用 `stdin`，因为输入流不能重新打开；单轮训练可省略 `-i` 或使用 `-i -`。使用 `--test` 时，测试策略始终为贪心，不进行探索。
 
 CSV 可用 Excel 导入，也可用 Python、R 等工具统计。重点比较 `featureN`、`weight_beforeN`、`contributionN`、`weight_deltaN` 和 `weight_afterN`，同时观察 `td_error` 与 `feature_norm`。例如，若某维 `weight_deltaN` 长期同号且绝对值持续增大，说明该维在持续推动权重漂移；若 `td_error` 很大而多维特征同时非零，需结合每维的 `weight_deltaN` 判断具体贡献。
 
@@ -551,7 +456,7 @@ python -m pip install matplotlib
 python .\analyze_training.py .\training_trace.csv --output .\training_analysis.png
 ```
 
-训练会在**当前工作目录**读取已有的 `q_weights.dat`（若存在）并保存训练后的模型。想从初始权重重新训练时，应先备份或移走旧模型文件。
+训练默认会在**当前工作目录**读取已有的 `q_weights.dat`（若存在）并保存训练后的模型。切换旧版训练流程时，建议使用 `--fresh` 从源码默认权重开始；若希望继续 DQN 训练，则不要加此参数。训练会覆盖 `q_weights.dat`，实验前请先备份。
 如果模型文件中已有 `nan`，程序会拒绝加载。先备份并移走该文件，再开始训练，例如：
 
 ```powershell
@@ -576,5 +481,5 @@ Get-Content .\3.txt | .\eluose.exe
 2. `q_weights.dat` 是纯权重文件，不包含随机种子、训练局数或超参数。程序加载后会继续训练；想比较不同实验，需自行备份模型。
 3. 训练按输入序列读取方块，但 epsilon-greedy 仍会随机探索落点；追踪文件记录每一步实际训练的方块编号。
 4. 训练局数增加不保证策略一定变强。可固定测试方块序列，在训练前后比较总分、存活步数或顶出次数。
-5. 特征计算是在方块临时放置后、实际消行清理前进行；下一状态则是在真实消行清理后计算。理解训练行为时要注意这两个棋盘时点不同。
+5. 行变化、洞数和井深特征按消除满行后的棋盘计算；高度和消行特征仍描述当前放置动作。提取候选特征后会恢复原棋盘。
 6. 代码将顶出边界固定为 `y + block_height > 14`，并将游戏最高高度也按此规则判负；修改棋盘尺寸或边界规则时，应同步检查特征提取、候选生成、奖励和游戏逻辑。

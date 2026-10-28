@@ -6,11 +6,11 @@ test calls the real `place_block` and `clear_lines` functions.
 Run from the repository root in PowerShell:
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -pedantic tests\test_game.c -o tests\test_game.exe
+gcc -std=c11 -Wall -Wextra -pedantic tests\test_game.c -lm -o tests\test_game.exe
 .\tests\test_game.exe
-gcc -std=c11 -Wall -Wextra -pedantic tests\test_training_update.c -o tests\test_training_update.exe
+gcc -std=c11 -Wall -Wextra -pedantic tests\test_training_update.c -lm -o tests\test_training_update.exe
 .\tests\test_training_update.exe
-gcc -std=c11 -Wall -Wextra -pedantic tests\test_extract_action_features.c -o tests\test_extract_action_features.exe
+gcc -std=c11 -Wall -Wextra -pedantic tests\test_extract_action_features.c -lm -o tests\test_extract_action_features.exe
 .\tests\test_extract_action_features.exe
 ```
 
@@ -67,20 +67,18 @@ and comparisons include all 25 rows and 15 columns of the board array.
 ## Training update tests
 
 `test_training_update.c` includes `eluose.c` with the application entry point
-renamed, then directly invokes `update_training_transitions` with small,
-hand-built transition queues. The test-only default `TD_N=3` allows a
-three-transition case without changing the production default.
+renamed, then directly invokes `update_dqn_batch` with hand-built replay
+transitions.
 
 The cases verify:
 
-- A three-transition update uses discounted rewards and the supplied bootstrap
-  value to update each corresponding feature weight.
-- A shorter queue with zero bootstrap uses its actual length and omits the
-  future-state value.
-- An empty queue succeeds without changing any weights.
+- Terminal targets use only the immediate reward, even when next-state
+  features are populated.
+- Nonterminal targets bootstrap from the target weights.
+- Large TD errors have a clipped Huber gradient.
 
-These are focused unit tests of the update function; they do not run a training
-episode or inspect CSV trace formatting.
+These are focused update tests; they do not run a complete training episode or
+inspect CSV trace formatting.
 
 ## Action feature tests
 
@@ -107,6 +105,6 @@ The Chinese feature labels in each case mean:
 
 Cases cover an empty board, completing one line with an O, a buried hole, a
 well between walls, a vertical I over an uneven stack, a T above a terraced
-board with holes and wells, and stacked placements with nonzero height. Two
-dense-board cases show eight occupied rows each (six existing rows plus the
-current piece), with varying terraces, holes, and wells.
+board with holes and wells, and stacked placements with nonzero height. For
+line-clear cases, geometry features are expected from the board after rows are
+removed.
