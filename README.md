@@ -1,6 +1,6 @@
 # 俄罗斯方块线性 DQN 训练说明
 
-本文对应源文件 [`eluose.c`](./eluose.c)：用 C 实现俄罗斯方块的落子与消行、6 维棋盘特征提取，以及一个线性函数近似器；训练采用一步 DQN + 经验回放。
+本文对应源文件 [`eluose.c`](./eluose.c)：用 C 实现俄罗斯方块的落子与消行、6 维棋盘特征提取，以及一个"线性主干 + 一层 tanh 隐藏层"的价值函数近似器；训练采用一步 DQN + 经验回放。
 
 > 先给结论：代码里的 `value_weights` 名字像"棋盘价值"，实际训练的对象是 `Q(s,a)`——奖励折在回归目标里，不是漏加。为什么这样是对的、为什么不建议"再加一个 R"，见 §6。
 
@@ -10,7 +10,7 @@
 - 1. 背景：强化学习与本程序
   - 1.1 概念对照
   - 1.2 一步 DQN 与经验回放
-  - 1.3 线性函数近似与 6 个特征
+  - 1.3 函数近似：线性主干 + 一层隐藏层
   - 1.4 探索与利用
 - 2. 代码解析
   - 2.1 全局状态与初始权重
@@ -83,15 +83,21 @@ delta  = target - Q(state, action)
 
 程序使用一步 DQN 目标，并把转移放入有限大小的经验回放区，随机抽取小批次训练。目标权重每隔一段更新步数才从在线权重复制一次，以降低目标快速漂移。批量更新使用 Huber TD 梯度和特征范数归一化；终局转移不 bootstrap。超参数在源码的 `DQN_*` 常量中设置（见 §2.7 与附录 A）。
 
-### 1.3 线性函数近似与 6 个特征
+### 1.3 函数近似：线性主干 + 一层隐藏层
 
-棋盘状态组合很多，程序没有为每个状态单独保存一项 Q 值，而是提取 6 个特征，用可训练权重计算动作价值：
+棋盘状态组合很多，程序没有为每个状态单独保存一项 Q 值，而是提取 6 个特征，用一组可训练参数计算动作价值。当前模型是"线性主干 + 一层 tanh 隐藏层"的残差结构：
 
 ```text
-Q(s, a) ≈ w₀φ₀ + w₁φ₁ + ... + w₅φ₅
+Q(s, a) ≈ w·φ  +  Σ_h W2_h · tanh( b_h + Σ_j W1_hj · φ_j · scale_j )
 ```
 
-代码中的 `features` 是特征向量 `φ`，`value_weights` 是权重 `w`。当前仍是 6 个输入、单个线性输出的动作价值模型；DQN 的经验回放和目标权重机制不改变 `q_weights.dat` 的六个参数格式。
+- **主干**（`value_weights`，6 个参数）就是原来那个线性模型，保留为直连路径。
+- **隐藏层**（16 个 tanh 单元）并联在主干上，负责表示特征之间的交互，例如"洞数和井深必须同时很大、局面才真的差"这类线性项表达不了的关系。
+- 隐藏层输入端先按固定常数缩放（`HIDDEN_INPUT_SCALE`），否则井深、洞数动辄上百，`tanh` 一开始就饱和、梯度消失。
+
+用残差而不是纯 MLP 的原因：输出权重 `w2` 全为 0 时隐藏项恒为 0，整个网络**严格等于原来的线性模型**，已经训练好的 `q_weights.dat` 不会作废。代价是 `w2=0` 时 `∂Q/∂w1 ≡ 0`（表示部分永远学不动），所以训练入口会给 `w2` 一个很小的非零初值。
+
+代码中的 `features` 是特征向量 `φ`，`value_weights` 是主干权重，隐藏层参数放在 `hidden`（在线网络）与 `target_hidden`（目标网络）里。模型文件 `q_weights.dat` 现在以 `mlp 16` 开头；旧的 6 行纯线性文件仍然能读（读进来等价于 `w2=0`）。
 
 特征描述的是"把当前方块放到某个位置后"的棋盘：
 
@@ -129,7 +135,7 @@ double value_weights[FEATURE_COUNT] = {-45.0, 34.0, -32.0, -93.0, -79.0, -34.0};
 
 - `board` 声明为 25×15，实际只用到 `[0..19][0..9]`；`y=0` 是棋盘底部，`y=19` 是顶部，`x=0..9` 从左到右。
 - `FEATURE_COUNT` 固定特征数量为 6，特征抽取、价值计算、模型读写和参数更新都使用这个数量。
-- `value_weights` 保存线性模型参数。程序首次运行、且当前目录没有 `q_weights.dat` 时使用这里的初始权重；训练中原地更新，结束后写入模型文件。
+- `value_weights` 保存线性主干的 6 个参数。程序首次运行、且当前目录没有 `q_weights.dat` 时使用这里的初始权重；训练中原地更新，结束后连同隐藏层参数一起写入模型文件。隐藏层参数在 `hidden` / `target_hidden`（`HIDDEN_SIZE = 16`，每层 16×6 权重 + 16 偏置 + 16 输出权重）。
 - `reset_value_model` 又用一份局部数组写了一遍同样的 6 个初值，`--fresh` 走的就是它——**改初值时两处要一起改**。
 
 `block_r` / `block_w` / `block_h` 是按方块和旋转角预置的旋转数、宽度与高度。注意 `block_w` / `block_h` 记的是**跨度**（最大 `dx` / `dy`），不是格子数，所以"落点高度"特征用 `y + block_h - 1` 时会比真实最高行小 1；同一决策内这是常数偏移，不影响 `argmax`。
@@ -258,16 +264,17 @@ typedef struct{
 - `features`：该动作对应的棋盘特征。
 - `value`：根据当前权重计算的动作价值，用于 epsilon-greedy 选择。
 
-`score_features(value_weights,features)` 是 6 项点积 `wᵀφ`：`static` 表示只在本文件内使用，`score` 从 `0.0` 起、用 `double` 保留小数精度，权重由调用方传入所以函数不依赖全局模型状态。分数越高，实际价值估计越大，策略越倾向选择该落点。
+`score_features(weights,layer,features)` 先算 6 项点积 `wᵀφ`，再叠加隐藏层项 `Σ_h w2_h·tanh(...)`。`static` 表示只在本文件内使用；权重和隐藏层都由调用方传入，所以函数本身不依赖全局模型状态——传 `value_weights, &hidden` 是在线网络，传 `target_weights, &target_hidden` 就是目标网络。分数越高，实际价值估计越大，策略越倾向选择该落点。单个隐单元的前向在 `hidden_unit_output` 里：`tanh(b_h + Σ_j w1_hj·φ_j·scale_j)`。
 
 ```c
 static training_action generate_action(int shape,double epsilon,
-                                       const double value_weights[FEATURE_COUNT]){
+                                       const double value_weights[FEATURE_COUNT],
+                                       const hidden_layer *layer){
     training_action actions[40];
     int count=0;
 ```
 
-函数最多枚举 40 个候选动作：旋转数最多为 4，每个旋转枚举 10 个横向位置。权重和探索概率由调用方传入；无可用动作时返回 `valid` 为 0 的结果。
+函数最多枚举 40 个候选动作：旋转数最多为 4，每个旋转枚举 10 个横向位置。权重、隐藏层（`layer`）和探索概率由调用方传入；无可用动作时返回 `valid` 为 0 的结果。
 
 ```c
     for(int rotation=0;rotation<block_r[shape];rotation++){
@@ -313,7 +320,7 @@ static training_action generate_action(int shape,double epsilon,
 提取候选落点特征。这里候选已由合法性检查和模拟下落确定为可放置。
 
 ```c
-            action->value=score_features(value_weights,action->features);
+            action->value=score_features(value_weights,layer,action->features);
 ```
 
 - `value` 始终是使用传入权重计算出的实际价值。
@@ -354,24 +361,23 @@ epsilon-greedy 选择在探索时从所有候选动作中随机选取，在利�
 - 其他打开错误会输出错误信息并返回 `-1`，不会静默地把损坏或不可读模型当成成功加载。
 
 ```c
-    double loaded[FEATURE_COUNT];
-    for(int i=0;i<FEATURE_COUNT;i++){
-        if(fscanf(fp,"%lf",&loaded[i])!=1||!isfinite(loaded[i])){
-            fprintf(stderr,"价值模型格式错误：%s\n",path);
-            fclose(fp);
-            return -1;
-        }
-    }
-    fclose(fp);
-    for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=loaded[i];
-    return 1;
+    char tag[16];
+    if(fscanf(fp,"%15s",tag)!=1) return -1;   /* 连标签都读不到 */
+    int ok=0;
+    if(strcmp(tag,"mlp")==0){
+        int size=0;
+        if(fscanf(fp,"%d",&size)==1&&size==HIDDEN_SIZE){
+            ok=1;
+            /* 依次读 6 个主干权重、16 个 b1、16×6 个 w1、16 个 w2 */
 ```
 
-- 临时读入 6 个权重；`fscanf` 失败或读到非有限数（无穷大、NaN）时报格式错误。
-- 先读到临时数组，确认全部有效后才覆盖正在使用的权重。
+- 文件第一行是 `mlp 16`（隐藏层单元数），其后 135 行依次是主干 6 个、`b1` 16 个、`w1` 96 个、`w2` 16 个。
+- **兼容旧格式**：如果第一行不是 `mlp`，就把它当作第一个主干权重，再读剩下 5 个；隐藏层全部置 0，等价于直接退化成原来的线性模型。
+- 读到非有限数（无穷大、NaN）或参数个数与 `HIDDEN_SIZE` 不符时报格式错误。
+- 先读进临时数组与临时结构体，确认全部有效后才覆盖正在使用的权重，避免半截损坏的模型污染当前参数。
 - 返回 `1` 表示成功加载。
 
-`save_value_model(path)`：以写入模式创建或覆盖文件，每行写一个权重（`%.12g`，足够保留训练得到的小数），最后检查 `fclose` 的返回值。文件打不开或关闭失败都输出错误并返回 `0`。
+`save_value_model(path)`：以写入模式创建或覆盖文件，先写 `mlp 16`，再按主干 → `b1` → `w1` → `w2` 的顺序逐行写参数（`%.12g`，足够保留训练得到的小数），最后检查 `fclose` 的返回值。文件打不开或关闭失败都输出错误并返回 `0`。
 
 模型文件默认名为 `q_weights.dat`，路径相对于程序运行时的当前工作目录。
 
@@ -405,7 +411,7 @@ typedef struct{
 }replay_transition;
 ```
 
-`replay_buffer[50000]` 是环形缓冲（`replay_next` 回绕），`target_weights` 是目标网络参数，`dqn_update_count` 累计批量更新次数。`random_below` 用两次 `rand()` 拼出一个比 `RAND_MAX` 宽得多的无符号数再取模，避开单个 `rand()` 范围过窄带来的重复模式。
+`replay_buffer[50000]` 是环形缓冲（`replay_next` 回绕），`target_weights` 与 `target_hidden` 是目标网络参数，`dqn_update_count` 累计批量更新次数。`random_below` 用两次 `rand()` 拼出一个比 `RAND_MAX` 宽得多的无符号数再取模，避开单个 `rand()` 范围过窄带来的重复模式。
 
 `update_dqn_batch` 的更新式为：
 
@@ -413,11 +419,15 @@ typedef struct{
 clipped_td = clamp(target - current_value, -100, 100)
 norm       = 1 + Σᵢ φᵢ²
 Δwᵢ       = alpha × Σ_batch (clipped_td × φᵢ / norm) / 32
+Δw2ₕ      = alpha × Σ_batch (clipped_td × tanh(zₕ) / norm) / 32
+Δbₕ       = alpha × Σ_batch (clipped_td × w2ₕ × (1 - tanh²(zₕ)) / norm) / 32
+Δw1ₕⱼ     = alpha × Σ_batch (clipped_td × w2ₕ × (1 - tanh²(zₕ)) × φⱼ × scaleⱼ / norm) / 32
 ```
 
 - 除以 `norm` 是按特征范数归一化，避免 6 维特征同时很大时梯度爆炸。
 - 所谓 Huber 在这里实际只体现为**对 TD 误差做 ±100 的裁剪**，并没有二次段。
 - 梯度除以批量大小，`alpha` 是学习率。
+- 隐藏层用同一套 `clipped_td` 与 `norm` 反传，`tanh'(z) = 1 - tanh²(z)`。主干的 `clipped_td` 与更新量不变，所以隐藏层的加入不会改动原来那 6 个权重的更新式；所有新参数先算完、逐个检查有限，再统一写回，避免只写了一半。
 
 ### 2.8 单步训练与单局训练
 
@@ -441,7 +451,7 @@ target        = terminal ? reward : reward + 0.99 * next_value
 
 ### 2.9 训练主循环 `train_value_model`
 
-训练开始时将当前 6 个权重复制到目标权重，并清空回放区。之后的流程就是循环调用 `train_value_episode`：
+训练开始时将当前参数（主干 6 个 + 隐藏层）复制到目标网络，并清空回放区。之后的流程就是循环调用 `train_value_episode`：
 
 - 每步按 epsilon-greedy 选择动作，执行落子和消行后保存 `features`、奖励、终局标志及下一方块的贪心动作特征。
 - 回放区达到 64 条经验后，每步随机抽取 32 条进行更新；每 500 次批量更新同步一次目标权重，学习率为 `0.0001`。
@@ -473,7 +483,7 @@ score
 - `--test 测试文件` 训练时比较训练前后的贪心表现；不带 `--train` 时单独评估当前模型。建议测试集与 `-i` 训练集分离。
 - `--eval-trace CSV文件` 将训练前、训练中周期评估及训练后的测试结果写入独立 CSV；需要同时指定 `--test`。
 - `--eval-interval 局数` 设置周期测试频率，默认每 100 局；每次中途采样 20 个测试片段，训练前/后使用 100 个片段。
-- `--fresh` 训练时忽略已有 `q_weights.dat`，从源码中的初始 6 个权重开始。
+- `--fresh` 训练时忽略已有 `q_weights.dat`，从源码中的初始权重开始（主干用初始 6 个，隐藏层用 `seed_hidden_layer` 的小初值）。
 - `--trace CSV文件` 可选，仅用于训练模式，记录每步训练数据。
 - 参数顺序不限，例如 `eluose.exe -i .\1.txt --train 1000` 与 `eluose.exe --train 1000 -i .\1.txt` 等价。
 - 追踪文件不能与 `q_weights.dat` 同名，程序会拒绝。
@@ -586,7 +596,7 @@ Get-Content .\3.txt | .\eluose.exe
 .\eluose.exe -i .\3.txt
 ```
 
-模型文件每行一个浮点权重，共 6 行。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
+模型文件第一行是 `mlp 16`，其后每行一个浮点参数，共 135 行（主干 6 + 偏置 16 + 隐藏权重 96 + 输出权重 16）。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
 
 ## 5. 常见问题与注意事项
 
@@ -602,7 +612,7 @@ Get-Content .\3.txt | .\eluose.exe
 6. **训练变久不等于变强**：可见指标会波动。固定测试序列、比较训练前后的总分/存活步数/顶出率，比看单局得分可靠。
 7. **探索仍在发生**：训练按输入序列读取方块，但 epsilon-greedy 仍会随机探索落点；追踪文件记录的是每一步实际训练的方块编号。
 8. **顶出边界是硬编码的 14**：`y + block_h > 14`，训练、评估、对局共用这一条规则；改棋盘尺寸或成功判据时，特征提取、候选生成、奖励和游戏逻辑要一起检查。
-9. **保存的模型无法向后兼容**：`q_weights.dat` 只有 6 个数，特征是 6 维；一旦改特征维度（例如把 `feature1` 拆成 `fill_line` 与格子数两维，见 §6.6），旧权重文件就不能再用，需要重训。
+9. **改了特征维度就要重训**：隐藏层的输入维度固定为 6，一旦改特征维度（例如把 `feature1` 拆成 `fill_line` 与格子数两维，见 §6.6），旧权重文件就不能再用。旧的 6 行纯线性文件仍可加载（隐藏层按 0 处理），但那只是兼容旧文件，不是等价替换。
 10. **几个不影响结果但值得知道的小问题**：`board` 声明 25×15 但只用 20×10；`block_w`/`block_h` 是跨度而非格子数，`features[0]` 因此比真实最高行小 1；`get_block` 用 `char` 接收 `fgetc` 的返回值，`0xFF` 字节会被误判成 EOF（输入是字母，实际不触发）。
 
 ## 6. 概念辨析：这个模型到底在学 V 还是 Q
@@ -727,7 +737,7 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 #### `void reset_value_model(void)`
 
-- **功能**：把 `value_weights` 恢复成源码里的 6 个初始权重。
+- **功能**：把 `value_weights` 恢复成源码里的 6 个初始权重，并把隐藏层清零（`w2=0`，此时严格等价于纯线性模型）。
 - **输入**：无。
 - **输出**：无（就地改全局）。
 - **注意**：初值在 61–62 行与 85–86 行各写了一遍，改初值要两处同改。
@@ -776,12 +786,19 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ### 7.2 特征与打分
 
-#### `double score_features(const double value_weights[6],const double features[6])`
+#### `double score_features(const double weights[6],const hidden_layer *layer,const double features[6])`
 
-- **功能**：6 维点积 `wᵀφ`，即线性价值估计。
-- **输入**：权重数组、特征数组。
+- **功能**：估值 = 6 维点积 `wᵀφ`，再加隐藏层项 `Σ_h w2_h·tanh(·)`。
+- **输入**：主干权重数组、隐藏层指针（在线或目标）、特征数组。
 - **输出**：`double` 估值，可为负。
-- **注意**：无状态，权重由调用方给：传 `value_weights` 就是在线网络，传 `target_weights` 就是目标网络。
+- **注意**：无状态，权重与隐藏层都由调用方给：传 `value_weights, &hidden` 就是在线网络，传 `target_weights, &target_hidden` 就是目标网络。
+
+#### `double hidden_unit_output(const hidden_layer *layer,int unit,const double features[6])`
+
+- **功能**：算一个隐单元的输出 `tanh(b_h + Σ_j w1_hj·φ_j·scale_j)`。
+- **输入**：隐藏层指针、单元下标、特征数组。
+- **输出**：`[-1, 1]` 之间的 `double`。
+- **注意**：输入先乘 `HIDDEN_INPUT_SCALE` 再进 `tanh`；前向打分与反向传播都复用这个函数，保证两边算的是同一个 `z`。
 
 #### `int extract_action_features(int shape,int rotation,int x,int y,int block_height,double features[6])`
 
@@ -799,10 +816,10 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ### 7.3 动作生成与对局
 
-#### `training_action generate_action(int shape,double epsilon,const double value_weights[6])`
+#### `training_action generate_action(int shape,double epsilon,const double weights[6],const hidden_layer *layer)`
 
 - **功能**：枚举所有候选落点、算特征与价值，再按 epsilon-greedy 选一个。
-- **输入**：方块编号、探索概率、用于打分的权重。
+- **输入**：方块编号、探索概率、用于打分的主干权重、隐藏层指针。
 - **输出**：`training_action`（`valid/rotation/x/y/top_out/features/value`）；无候选或 `shape` 非法时返回全 0 的结构（`valid=0`）。
 - **注意**：候选上限 40（旋转 ≤4 × 横坐标 10）；特征提取失败的候选会被 `count--` 丢弃；贪心只在 `!top_out` 中取最大，全是顶出动作时退化为第 0 个。
 
@@ -831,17 +848,38 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 #### `int load_value_model(const char *path)`
 
-- **功能**：从文本文件读 6 个权重进全局 `value_weights`。
+- **功能**：从文本文件读全部模型参数进 `value_weights` 与 `hidden`。
 - **输入**：文件路径。
 - **输出**：`1` 成功；`0` 文件不存在（`errno==ENOENT`，调用方可用初始权重继续）；`-1` 打开失败、读取失败或读到非有限数。
-- **注意**：先读进临时数组，全部有效才覆盖，避免半截损坏的模型污染当前权重。
+- **注意**：先读进临时数组与临时结构体，全部有效才覆盖；以 `mlp 16` 开头的是新格式，否则按旧的 6 行纯线性文件解析（隐藏层按 0 处理）。
 
 #### `int save_value_model(const char *path)`
 
-- **功能**：把 6 个权重按行写回文本文件。
+- **功能**：把全部参数按行写回文本文件（`mlp 16` → 主干 6 → `b1` 16 → `w1` 96 → `w2` 16）。
 - **输入**：文件路径。
 - **输出**：`1` 成功；`0` 打不开或 `fclose` 失败。
-- **注意**：每行 `%.12g`；会覆盖同名文件，不做备份。
+- **注意**：每行 `%.12g`，共 135 行；会覆盖同名文件，不做备份。
+
+#### `void fill_hidden_w1(void)`
+
+- **功能**：给 `w1` 填确定性的、各单元互不相同的初值。
+- **输入**：无。
+- **输出**：无。
+- **注意**：16 个单元如果初值相同，梯度会一直相同，等于只训练了一个单元。
+
+#### `void reset_hidden_layer(void)`
+
+- **功能**：`w1` 重新取值、`b1` 与 `w2` 清零，并把 `hidden` 同步给 `target_hidden`。
+- **输入**：无。
+- **输出**：无。
+- **注意**：`w2=0` 时隐藏项恒为 0，`score_features` 退化成 6 项点积；测试里可以用它构造纯线性基准。
+
+#### `void seed_hidden_layer(void)`
+
+- **功能**：给 `b1`、`w2` 一点非零小初值，作为训练起点。
+- **输入**：无。
+- **输出**：无。
+- **注意**：`w2=0` 时 `∂Q/∂w1 ≡ 0`，表示部分永远学不动，所以 `--fresh` 训练开始前必须调它。
 
 ### 7.5 追踪记录
 
@@ -884,10 +922,10 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 #### `int update_dqn_batch(const replay_transition batch[32],int batch_size,double alpha,double gamma,double updates[6],double *mean_absolute_td)`
 
-- **功能**：对一个批次做一次梯度下降，就地更新 `value_weights`。
+- **功能**：对一个批次做一次梯度下降，就地更新 `value_weights` 与隐藏层参数。
 - **输入**：批次数组、实际批量、学习率、折扣率、`updates[6]`（输出每维权重增量）、`*mean_absolute_td`（输出平均 `|TD|`）。
 - **输出**：`1` 成功；`0` 批量非法或中途出现非有限数。
-- **注意**：`current_value` 是用**当前** `value_weights` **重算**的，而不是回放里存的 `action->value`；"Huber"在这里实际只是把 TD 误差裁剪到 `±100`，没有二次段；再按 `1+Σφᵢ²` 归一化后累加梯度，最后 `Δwᵢ = alpha·Σ(clipped_td·φᵢ/norm)/batch_size`。
+- **注意**：`current_value` 是用**当前** `value_weights` **重算**的，而不是回放里存的 `action->value`；"Huber"在这里实际只是把 TD 误差裁剪到 `±100`，没有二次段；再按 `1+Σφᵢ²` 归一化后累加梯度，最后 `Δwᵢ = alpha·Σ(clipped_td·φᵢ/norm)/batch_size`；隐藏层用同一套 `clipped_td` / `norm` 反传（`Δw2`、`Δb1`、`Δw1`），主干那 6 个权重的更新式不变。
 
 #### `int train_on_transition(FILE *trace,int episode,unsigned long long turn,int shape,const training_action *action,double epsilon,int score,int board_cells,const replay_transition *transition)`
 
@@ -937,45 +975,51 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ## 附录 A 源码索引
 
-行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1085 行）。源码改动后请只更新这张表。
+行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1229 行）。源码改动后请只更新这张表。
 
 | 行号 | 内容 |
 | --- | --- |
 | 7–59 | `block[7][4][4][2]` 七种方块的四个旋转格坐标 |
 | 60 | `board[25][15]` |
 | 61–62 | `FEATURE_COUNT`、初始 `value_weights` |
-| 63–81 | `block_r` / `block_w` / `block_h` |
-| 82 | `can_place` 前置声明 |
-| 84–88 | `reset_value_model` |
-| 90–123 | `place_block` |
-| 125–144 | `clear_lines` |
-| 146–151 | `remove_block` |
-| 153–163 | `can_place` |
-| 164–171 | `simulate_fall` |
-| 173–195 | `evaluate_board` |
-| 196–200 | `training_action` |
-| 202–206 | `score_features` |
-| 208–234 | `extract_action_features` |
-| 235–251 | `get_block` |
-| 253–295 | `generate_action` |
-| 297–308 | `find_best_position` |
-| 310–328 | `load_value_model` |
-| 330–342 | `save_value_model` |
-| 344–354 | `write_training_trace_header` |
-| 355–365 | `write_evaluation_trace_header` |
-| 366–398 | `record_training_data` |
-| 399–410 | `DQN_*` / `EVALUATION_*` 常量 |
-| 412–417 | `replay_transition` |
-| 419–423 | 回放区与目标权重全局变量 |
-| 425–429 | `random_below` |
-| 431–481 | `update_dqn_batch` |
-| 483–487 | `add_replay_transition` |
-| 489–531 | `train_on_transition` |
-| 533–603 | `train_value_episode` |
-| 605–610 | 两个前置声明 |
-| 608–663 | `train_value_model` |
-| 665–677 | 评估用结构体与 `normalize_feature` |
-| 679–716 | `run_evaluation_episode` |
-| 718–805 | `evaluate_value_model` |
-| 807–845 | `run_game` |
-| 847–1085 | `main` |
+| 64–80 | 隐藏层类型与全局参数：`HIDDEN_SIZE`、`hidden` / `target_hidden` / `target_weights`、`HIDDEN_INPUT_SCALE` |
+| 82–100 | `block_r` / `block_w` / `block_h` |
+| 101 | `can_place` 前置声明 |
+| 105–110 | `fill_hidden_w1` |
+| 112–120 | `reset_hidden_layer` |
+| 123–129 | `seed_hidden_layer` |
+| 131–136 | `reset_value_model` |
+| 138–171 | `place_block` |
+| 173–192 | `clear_lines` |
+| 194–199 | `remove_block` |
+| 201–210 | `can_place` |
+| 212–219 | `simulate_fall` |
+| 221–242 | `evaluate_board` |
+| 244–248 | `training_action` |
+| 250–256 | `hidden_unit_output` |
+| 258–265 | `score_features` |
+| 267–292 | `extract_action_features` |
+| 294–310 | `get_block` |
+| 312–355 | `generate_action` |
+| 357–368 | `find_best_position` |
+| 370–419 | `load_value_model` |
+| 421–439 | `save_value_model` |
+| 441–450 | `write_training_trace_header` |
+| 452–461 | `write_evaluation_trace_header` |
+| 463–494 | `record_training_data` |
+| 496–507 | `DQN_*` / `EVALUATION_*` 常量 |
+| 509–514 | `replay_transition` |
+| 516–519 | 回放区与目标网络全局变量 |
+| 521–525 | `random_below` |
+| 527–620 | `update_dqn_batch` |
+| 622–626 | `add_replay_transition` |
+| 628–672 | `train_on_transition` |
+| 674–744 | `train_value_episode` |
+| 746–747 | `evaluate_value_model` 前置声明 |
+| 749–804 | `train_value_model` |
+| 806–811 | 评估统计结构体 |
+| 813–818 | `normalize_feature` |
+| 820–857 | `run_evaluation_episode` |
+| 859–946 | `evaluate_value_model` |
+| 948–986 | `run_game` |
+| 988–1229 | `main` |

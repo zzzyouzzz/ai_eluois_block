@@ -24,6 +24,7 @@ static void reset_weights(void){
         value_weights[i]=0.0;
         target_weights[i]=0.0;
     }
+    reset_hidden_layer();   /* 隐藏层归零，使 Q 退化为纯线性模型 */
 }
 
 static void test_terminal_target_uses_only_reward(void){
