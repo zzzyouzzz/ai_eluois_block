@@ -9,18 +9,30 @@
    参数配置区
    所有可调参数集中在这里：改完重新编译即可生效。命令行只剩下
    --train / -i 两个"选模式、指文件"的参数。
+
+   组装实验时可以用编译参数临时覆盖运行参数，例如
+   gcc -DTRAIN_EPISODES=200 -DTRAINING_TRACE_PATH='"batch.csv"' ...
+   （见 run_experiments.ps1），不改源码也能换局数与追踪文件名。
    ================================================================== */
 
 /* ---------- 运行参数 ---------- */
 
 /* 训练局数（命令行不再接受数字） */
+#ifndef TRAIN_EPISODES
 #define TRAIN_EPISODES 2000
+#endif
 /* 是否忽略已保存的模型、从源码里的初始权重开始训练：1 = 忽略，0 = 沿用 */
+#ifndef TRAIN_FRESH
 #define TRAIN_FRESH 0
+#endif
 /* 模型文件路径（训练结束写这里，平时从这里读） */
+#ifndef VALUE_MODEL_PATH
 #define VALUE_MODEL_PATH "q_weights.dat"
+#endif
 /* 每步训练数据写入的追踪 CSV；空字符串 "" 表示不追踪 */
+#ifndef TRAINING_TRACE_PATH
 #define TRAINING_TRACE_PATH "training_trace.csv"
+#endif
 
 /* ---------- DQN 训练参数 ---------- */
 
@@ -41,11 +53,6 @@
 #define DQN_GAMMA 0.99
 /* 学习率 */
 #define DQN_LEARNING_RATE 0.0001
-
-/* ---------- 训练日志 ---------- */
-
-/* 每多少局打印一次窗口平均得分与存活步数 */
-#define TRAINING_LOG_INTERVAL 100
 const int block[7][4][4][2] = {
     // I型
     {
@@ -748,15 +755,10 @@ static int train_on_transition(const replay_transition *transition){
 }
 
 static int train_value_episode(FILE *block_input,int episode,
-                               double epsilon,int *has_training_data,
-                               int *episode_score,int *survival_steps){
+                               double epsilon,int *has_training_data){
     memset(board,0,sizeof(board));
     *has_training_data=0;
-    *episode_score=0;
-    *survival_steps=0;
     int shape=get_block(block_input);
-    if(shape<0||shape==7)return 1;
-
     for(unsigned long long turn=1;;turn++){
         training_action action=generate_action(shape,epsilon,value_weights,&hidden);
         if(!action.valid){
@@ -807,8 +809,6 @@ static int train_value_episode(FILE *block_input,int episode,
         if(!train_on_transition(&transition))
             return 0;
         trace_end_step();
-        *episode_score+=score;
-        *survival_steps=(int)turn;
         *has_training_data=1;
         if(terminal)break;
         shape=next_shape;
@@ -824,8 +824,6 @@ static int train_value_model(int episodes,const char *input_path,
     replay_next=0;
     dqn_update_count=0;
     *completed_episodes=0;
-    int window_count=0;
-    double window_score=0.0,window_steps=0.0;
 
     for(int episode=0;episode<episodes;episode++){
         FILE *block_input=stdin;
@@ -839,10 +837,8 @@ static int train_value_model(int episodes,const char *input_path,
 
         double epsilon=0.35-0.30*(double)episode/episodes;
         if(epsilon<0.05)epsilon=0.05;
-        int has_training_data=0,episode_score=0,survival_steps=0;
-        int success=train_value_episode(block_input,episode+1,epsilon,
-                                        &has_training_data,&episode_score,
-                                        &survival_steps);
+        int has_training_data=0;
+        int success=train_value_episode(block_input,episode+1,epsilon,&has_training_data);
         if(block_input!=stdin&&fclose(block_input)!=0){
             fprintf(stderr,"关闭训练输入文件失败：%s\n",input_path);
             return 0;
@@ -850,17 +846,6 @@ static int train_value_model(int episodes,const char *input_path,
         if(!success)return 0;
         if(!has_training_data)break;
         (*completed_episodes)++;
-        window_count++;
-        window_score+=episode_score;
-        window_steps+=survival_steps;
-        if(window_count==TRAINING_LOG_INTERVAL||episode+1==episodes){
-            printf("训练局 %d-%d：平均得分 %.2f，平均存活步数 %.2f，epsilon %.3f\n",
-                   episode+2-window_count,episode+1,
-                   window_score/window_count,window_steps/window_count,epsilon);
-            window_count=0;
-            window_score=0.0;
-            window_steps=0.0;
-        }
     }
     return 1;
 }

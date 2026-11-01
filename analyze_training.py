@@ -10,6 +10,7 @@
 
 import argparse
 import csv
+import glob
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -64,7 +65,7 @@ def feature_scale(index, value, board_cells):
     return value / max(board_cells, 4.0)
 
 
-def load_training_trace(path):
+def load_training_trace(path, episode_offset=0):
     required = {
         "episode",
         "turn",
@@ -100,7 +101,9 @@ def load_training_trace(path):
             raise SystemExit(f"训练追踪缺少列：{', '.join(sorted(missing))}")
         for row_number, row in enumerate(reader, start=2):
             try:
-                episode = int(parse_number(row, "episode", row_number))
+                episode = episode_offset + int(
+                    parse_number(row, "episode", row_number)
+                )
                 parse_number(row, "turn", row_number)
                 score = parse_number(row, "score", row_number)
                 epsilon = parse_number(row, "epsilon", row_number)
@@ -162,7 +165,36 @@ def load_training_trace(path):
     return result, rows
 
 
-def plot_training(trace_path, episodes, rows, window, output_path):
+def load_test_log(path):
+    """读 run_experiments.ps1 写出的每批测试得分。"""
+    required = {"batch", "cum_episodes", "test_score"}
+    rows = []
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise SystemExit(f"测试得分表缺少列：{', '.join(sorted(missing))}")
+        for row_number, row in enumerate(reader, start=2):
+            def value(key, default=0.0):
+                if key not in row or row[key] in (None, ""):
+                    return default
+                return parse_number(row, key, row_number)
+
+            rows.append(
+                {
+                    "batch": int(value("batch")),
+                    "episodes": int(value("episodes")),
+                    "cum_episodes": int(value("cum_episodes")),
+                    "test_score": value("test_score"),
+                    "test_pieces": value("test_pieces"),
+                }
+            )
+    if not rows:
+        raise SystemExit(f"测试得分表里没有数据：{path}")
+    return rows
+
+
+def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=None):
     episode_ids = sorted(episodes)
     scores = [episodes[e]["score"] for e in episode_ids]
     steps = [episodes[e]["steps"] for e in episode_ids]
@@ -183,9 +215,14 @@ def plot_training(trace_path, episodes, rows, window, output_path):
         for i in range(6)
     ]
 
-    figure, axes = plt.subplots(3, 2, figsize=(17, 14), constrained_layout=True)
+    figure, axes = plt.subplots(4, 2, figsize=(17, 18), constrained_layout=True)
+    source = (
+        trace_paths[0].name
+        if len(trace_paths) == 1
+        else f"{len(trace_paths)} 个追踪文件"
+    )
     figure.suptitle(
-        f"训练过程分析：{trace_path.name}（{len(episode_ids)} 局，{rows:,} 步）"
+        f"训练过程分析：{source}（{len(episode_ids)} 局，{rows:,} 步）"
     )
 
     ax = axes[0, 0]
@@ -198,6 +235,9 @@ def plot_training(trace_path, episodes, rows, window, output_path):
         linewidth=2,
         label=f"得分滚动均值（{window} 局）",
     )
+    ax.set_title("训练得分与存活步数")
+    ax.set_xlabel("训练局数")
+    ax.set_ylabel("得分")
     step_ax = ax.twinx()
     step_ax.plot(
         episode_ids,
@@ -206,9 +246,6 @@ def plot_training(trace_path, episodes, rows, window, output_path):
         linewidth=1.7,
         label=f"存活步数滚动均值（{window} 局）",
     )
-    ax.set_title("训练得分与存活步数")
-    ax.set_xlabel("训练局数")
-    ax.set_ylabel("得分")
     step_ax.set_ylabel("存活步数")
     ax.grid(alpha=0.25)
     handles, labels = ax.get_legend_handles_labels()
@@ -288,6 +325,27 @@ def plot_training(trace_path, episodes, rows, window, output_path):
     axes[2, 1].legend(fontsize=8)
     axes[2, 1].grid(alpha=0.25)
 
+    ax_test = axes[3, 0]
+    if test_rows:
+        ax_test.plot(
+            [row["cum_episodes"] for row in test_rows],
+            [row["test_score"] for row in test_rows],
+            color="#c62828",
+            marker="o",
+            markersize=5,
+            linewidth=1.6,
+            label="测试集得分",
+        )
+        ax_test.set_title("测试集得分变化（每批训练结束跑一次）")
+        ax_test.set_xlabel("累计训练局数")
+        ax_test.set_ylabel("测试集累计得分")
+        ax_test.legend(fontsize=8)
+        ax_test.grid(alpha=0.25)
+    else:
+        ax_test.set_axis_off()
+
+    axes[3, 1].set_axis_off()
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=160)
     plt.close(figure)
@@ -301,7 +359,16 @@ def main():
             "（TRAINING_TRACE_PATH）控制。"
         )
     )
-    parser.add_argument("trace", nargs="?", default="training_trace.csv")
+    parser.add_argument(
+        "trace",
+        nargs="+",
+        help="一个或多个训练追踪 CSV；多批次实验按顺序传入，"
+        "局号会首尾相接。",
+    )
+    parser.add_argument(
+        "--test-log",
+        help="run_experiments.ps1 写出的每批测试得分 CSV，用于画测试曲线。",
+    )
     parser.add_argument(
         "--output",
         default="training_analysis.png",
@@ -317,19 +384,44 @@ def main():
 
     if args.window < 1:
         parser.error("--window 必须大于零")
-    trace_path = Path(args.trace)
-    if not trace_path.is_file():
-        raise SystemExit(
-            f"找不到训练追踪文件：{trace_path}\n"
-            "生成方法：把 eluose.c 配置区里的 TRAINING_TRACE_PATH 改成 "
-            f'"{trace_path}"，重新编译后跑一次 `eluose.exe --train -i 1.txt`。'
-        )
+    trace_paths = []
+    for item in args.trace:
+        # PowerShell 不会为原生程序展开通配符，这里自己展开并排序
+        matches = sorted(glob.glob(item))
+        if not matches:
+            raise SystemExit(
+                f"找不到训练追踪文件：{item}\n"
+                "生成方法：把 eluose.c 配置区里的 TRAINING_TRACE_PATH 改成 "
+                f'"{item}"，重新编译后跑一次 `eluose.exe --train -i 1.txt`，'
+                "或者直接用 run_experiments.ps1 跑多批次实验。"
+            )
+        for match in matches:
+            path = Path(match)
+            if path not in trace_paths:
+                trace_paths.append(path)
+
+    test_rows = None
+    if args.test_log:
+        test_log = Path(args.test_log)
+        if not test_log.is_file():
+            raise SystemExit(
+                f"找不到测试得分表：{test_log}\n"
+                "它由 run_experiments.ps1 生成（runs\\test_scores.csv）。"
+            )
+        test_rows = load_test_log(test_log)
 
     prepare_matplotlib()
-    episodes, rows = load_training_trace(trace_path)
+    episodes = {}
+    rows = 0
+    offset = 0
+    for path in trace_paths:
+        part_episodes, part_rows = load_training_trace(path, offset)
+        episodes.update(part_episodes)
+        rows += part_rows
+        offset = max(episodes)
     output_path = Path(args.output)
     plot_training(
-        trace_path, episodes, rows, args.window, output_path
+        trace_paths, episodes, rows, args.window, output_path, test_rows
     )
     episode_ids = sorted(episodes)
     print(f"训练图：{output_path}")
@@ -342,6 +434,13 @@ def main():
         f"平均存活步数："
         f"{sum(episodes[e]['steps'] for e in episode_ids) / len(episode_ids):.3f}"
     )
+    if test_rows:
+        print("测试批次：")
+        for row in test_rows:
+            print(
+                f"  第 {row['batch']} 批（累计 {row['cum_episodes']} 局）："
+                f"得分 {row['test_score']:.0f}，落子 {row['test_pieces']:.0f} 步"
+            )
 
 
 if __name__ == "__main__":
