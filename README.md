@@ -490,6 +490,24 @@ score
 
 多轮训练必须用 `-i` 指定可重复打开的文件；不指定文件或使用 `-i -` 时只允许训练一轮。每轮训练前棋盘清空，重新打开输入文件并从头读取。输入 EOF、`E` 或 `X` 会结束当前轮，之后下一轮仍从文件开头重新读取。训练会加载已有 `q_weights.dat`（不存在则使用源码默认权重），并保存更新后的权重。
 
+### 2.12 数据追踪模块（可整段删除）
+
+追踪代码全部收在两条 banner 注释之间：从 `/* ====...` 开头的那段说明起，到 `/* ------------------------ 数据追踪模块结束 ------------------------ */` 为止。模块自己持有 `FILE *`，所以 `train_value_model` / `train_value_episode` / `train_on_transition` / `evaluate_value_model` 的签名里都没有追踪参数。训练代码里只剩下面几处插桩，每一处都是可单独删掉的整行：
+
+| 位置 | 插桩语句 | 作用 |
+| --- | --- | --- |
+| `main` | `trace_attach(trace,evaluation_trace);` | 把两个输出流交给模块 |
+| `main` | `trace_write_training_header()` / `trace_write_evaluation_header()` | 写两套表头 |
+| `main` | `trace_reset_evaluation(0);` | 标记一次独立评估的局号 |
+| `train_value_model` | `trace_reset_evaluation(*completed_episodes);` | 标记一次周期评估的局号 |
+| `train_value_episode` | `trace_begin_step(...)` / `trace_end_step();` | 抓更新前后的快照、写一行 |
+| `run_evaluation_episode` | `trace_accumulate_evaluation(&action);` | 累加该步的归一化特征 |
+| `evaluate_value_model` | `if(!trace_write_evaluation(...))return 0;` | 写评估汇总行 |
+
+原则只有一条：**"只为写 CSV 才需要"的计算不许留在训练代码里**。TD 五件套、棋盘方块数、权重前值快照、特征归一化与累加全部搬进模块；`update_dqn_batch` 也因此没了出参——以前的 `updates[6]` 换成"前后快照相减"，平均 `|TD|` 换成"逐条 TD 直接记"，函数本身只负责更新权重。
+
+把模块整段删掉、再删掉上表里的插桩行，剩下的代码照常编译、照常训练。仓库里实测过：去掉追踪后 `--test 1.txt` 仍是 22494.00 分 / 493.13 步 / 3.0% 顶出率，与带追踪时逐位相同。
+
 ## 3. 追踪 CSV 格式
 
 `--trace` 为每个环境动作记录一行。前 16 列为：
@@ -505,14 +523,14 @@ episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,current_value,next
 | `feature0` | 本次动作的特征值 `φ₀` |
 | `weight_before0` | 更新前权重 `w₀` |
 | `contribution0` | 该特征对当前估值的贡献 `w₀ × φ₀` |
-| `weight_delta0` | 本次批量更新的权重变化 `Δw₀` |
+| `weight_delta0` | 权重变化 `Δw₀ = weight_after0 − weight_before0` |
 | `weight_after0` | 更新后权重 |
 
 特征 1 到 5 同样记录。因为训练采用经验回放，一行表示一次实际环境动作；权重变化列记录此动作加入回放后执行的批量更新，**不代表单独由该行特征产生的更新**。`td_error` 是动作写入回放时计算的误差，后续重放会再次更新同一经验，因此 CSV 并非完整的逐次采样批次日志。
 
 `shape` 是方块编号：0=I、1=T、2=O、3=J、4=L、5=S、6=Z。
 
-`--eval-trace` 写的是另一套表头（`write_evaluation_trace_header`），按检查点记录测试集汇总指标，与上面的逐动作格式不同。
+`--eval-trace` 写的是另一套表头（`trace_write_evaluation_header`），按检查点记录测试集汇总指标，与上面的逐动作格式不同。
 
 ## 4. 编译、运行与可视化
 
@@ -807,12 +825,12 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 - **输出**：`1` 成功；`0` 不能放置（此时 `features` 已被清零）。
 - **注意**：内部**真的落子并消行**（调 `place_block` → 统计 → `clear_lines`），最后靠 `memcpy` 快照整体回滚；`place_block` 返回的消行得分被丢弃，所以特征里没有原始奖励，只有 `fill_line × 格子数` 这个近似。
 
-#### `double normalize_feature(int feature_index,double value,int board_cells)`
+#### `double trace_normalize_feature(int feature_index,double value,int board_cells)`
 
 - **功能**：把特征缩放到可比量级，**仅用于评估统计**。
 - **输入**：特征下标、原始值、当前棋盘方块总数。
 - **输出**：下标 0 除以 20（棋盘高），下标 1 除以 4（最多 4 格），其余除以 `max(board_cells,4)`。
-- **注意**：不参与训练，只影响测试报告里的"平均特征"和出图。
+- **注意**：已整体搬进追踪模块（原名 `normalize_feature`）；不参与训练，只影响测试报告里的"平均特征"和出图。删掉追踪模块时它一起消失，评估结果一个字都不会变。
 
 ### 7.3 动作生成与对局
 
@@ -881,28 +899,56 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 - **输出**：无。
 - **注意**：`w2=0` 时 `∂Q/∂w1 ≡ 0`，表示部分永远学不动，所以 `--fresh` 训练开始前必须调它。
 
-### 7.5 追踪记录
+### 7.5 数据追踪（可整段删除）
 
-#### `int write_training_trace_header(FILE *trace)`
+本组函数全部写在 `eluose.c` 里两条 banner 注释之间，**只读训练状态、只写 CSV**，不参与任何决策。训练代码里只留下几处单行插桩调用；把整段模块连同这些调用行一起删掉，训练与测试的行为、输出、随机数序列完全不变（已用"删掉后重新编译并跑对照测试"验证）。
 
-- **功能**：写训练追踪 CSV 的表头。
-- **输入**：已打开的可写流。
+#### `static FILE *trace_training_file` / `static FILE *trace_evaluation_file`
+
+模块自己持有两个输出流，因此训练函数的签名里不再出现 `FILE *trace` 参数。
+
+#### `void trace_attach(FILE *training,FILE *evaluation)`
+
+- **功能**：登记两个输出流。
+- **输入**：训练追踪流、测试追踪流（都可以是 `NULL`）。
+- **输出**：无。
+- **注意**：`NULL` 表示这一路不追踪，后续写函数遇到 `NULL` 直接 no-op，没有 IO 开销。
+
+#### `int trace_write_training_header(void)` / `int trace_write_evaluation_header(void)`
+
+- **功能**：分别写两套 CSV 的表头（训练 46 列、测试 23 列）。
+- **输出**：`1` 成功；`0` 写失败（调用方据此退出）。
+- **注意**：列名与顺序是 [`analyze_training.py`](./analyze_training.py) 的输入契约，改格式必须同步脚本。
+
+#### `int trace_begin_step(...)`
+
+- **功能**：在一步训练**更新权重之前**抓快照：局号、步号、方块、动作、`epsilon`、即时得分、TD 五件套（`current_value` / `next_value` / `target` / `td_error` / `norm`）、棋盘方块数、6 个权重的前值。
+- **输入**：`episode`、`turn`、`shape`、`action`、`epsilon`、`score`、`transition`。
+- **输出**：`1`（不追踪时同样返回 `1`）。
+- **注意**：这里的 `next_value` 用目标网络 `target_weights` / `target_hidden` 计算，与训练内部一致；这些量原先散落在训练函数里，现在全部收进模块。
+
+#### `int trace_end_step(void)`
+
+- **功能**：在权重更新**之后**补上 `weight_after` 与 `weight_delta`（= 更新后权重 − 快照里的权重），写出一整行。
+- **输出**：`1`；写失败返回 `0`。
+- **注意**：数值一律 `%.17g`；`weight_delta` 由前后两次快照相减得到，所以 `update_dqn_batch` 不需要再传出 `updates[]`。
+
+#### `void trace_reset_evaluation(int episode)`
+
+- **功能**：开始一次评估追踪，记下这次评估对应的训练局号。
+- **输入**：局号（独立测试传 `0`）。
+- **输出**：无。
+
+#### `void trace_accumulate_evaluation(const training_action *action)`
+
+- **功能**：累加一个评估步的归一化特征。
+- **输入**：该步动作指针。
+- **注意**：前两项按固定尺度归一化（`/20`、`/4`），其余按落子后棋盘占用格数归一化——这套规则同样只存在于模块内部。
+
+#### `int trace_write_evaluation(int sample_count,double mean_score,double mean_steps,double top_out_rate)`
+
+- **功能**：把一次评估的汇总行写进测试追踪 CSV。
 - **输出**：`1` 成功；`0` 写失败。
-- **注意**：前 16 列固定，随后每个特征追加 5 列（顺序必须与 `record_training_data` 完全一致）。
-
-#### `int write_evaluation_trace_header(FILE *trace)`
-
-- **功能**：写测试追踪 CSV 的表头（与训练追踪是两套格式）。
-- **输入**：已打开的可写流。
-- **输出**：`1` 成功；`0` 写失败。
-- **注意**：列是 `episode,games,mean_score,mean_survival_steps,top_out_rate`，之后每个特征追加 `featureN,weightN,contributionN`。
-
-#### `int record_training_data(...)`
-
-- **功能**：按表头格式写一行训练追踪数据。
-- **输入**：追踪流、`episode`、`turn`、`shape`、`action` 指针、`epsilon`、`score`、`reward`、`terminal`、`current_value`、`next_value`、`target`、`delta`、`norm`、`board_cells`、`before[6]`、`updates[6]`、`after[6]`。
-- **输出**：`1` 成功；`0` 写失败（并在 stderr 报错）。
-- **注意**：`trace` 为 `NULL` 时直接返回 `1`，是 no-op——所以不记追踪时这条路径没有 IO 开销。数值一律 `%.17g`。
 
 ### 7.6 训练
 
@@ -920,31 +966,31 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 - **输出**：无。
 - **注意**：`replay_next` 回绕，`replay_size` 封顶 50000；满了之后覆盖最旧的一条，不做随机淘汰。
 
-#### `int update_dqn_batch(const replay_transition batch[32],int batch_size,double alpha,double gamma,double updates[6],double *mean_absolute_td)`
+#### `int update_dqn_batch(const replay_transition batch[32],int batch_size,double alpha,double gamma)`
 
 - **功能**：对一个批次做一次梯度下降，就地更新 `value_weights` 与隐藏层参数。
-- **输入**：批次数组、实际批量、学习率、折扣率、`updates[6]`（输出每维权重增量）、`*mean_absolute_td`（输出平均 `|TD|`）。
+- **输入**：批次数组、实际批量、学习率、折扣率。
 - **输出**：`1` 成功；`0` 批量非法或中途出现非有限数。
 - **注意**：`current_value` 是用**当前** `value_weights` **重算**的，而不是回放里存的 `action->value`；"Huber"在这里实际只是把 TD 误差裁剪到 `±100`，没有二次段；再按 `1+Σφᵢ²` 归一化后累加梯度，最后 `Δwᵢ = alpha·Σ(clipped_td·φᵢ/norm)/batch_size`；隐藏层用同一套 `clipped_td` / `norm` 反传（`Δw2`、`Δb1`、`Δw1`），主干那 6 个权重的更新式不变。
 
-#### `int train_on_transition(FILE *trace,int episode,unsigned long long turn,int shape,const training_action *action,double epsilon,int score,int board_cells,const replay_transition *transition)`
+#### `int train_on_transition(const replay_transition *transition)`
 
-- **功能**：处理一条环境转移的完整训练步骤：算 TD、写回放、可能触发批量更新与目标同步、写追踪行。
-- **输入**：追踪流、局号、步号、方块、动作指针、`epsilon`、得分、棋盘方块数、转移指针。
-- **输出**：`1` 成功；`0` 数值异常或写盘失败。
-- **注意**：`current_value` 直接取 `action->value`（选择时算好的那个），与 `update_dqn_batch` 里重算的 current 不是同一个值——所以 CSV 里的 `td_error` 与批量更新用的误差会有细微差异。回放攒够 64 条才开始更新；每 500 次更新同步一次 `target_weights`。
+- **功能**：处理一条环境转移的完整训练步骤：写回放、可能触发批量更新与目标同步。
+- **输入**：转移指针。
+- **输出**：`1` 成功；`0` 数值异常。
+- **注意**：只做训练本身，不做任何追踪——CSV 需要的 `current_value`、`episode`、`epsilon` 等由调用点前面的 `trace_begin_step` 自己抓。回放攒够 64 条才开始更新；每 500 次更新同步一次 `target_weights` 与 `target_hidden`。
 
-#### `int train_value_episode(FILE *block_input,FILE *trace,int episode,double epsilon,int *has_training_data,int *episode_score,int *survival_steps)`
+#### `int train_value_episode(FILE *block_input,int episode,double epsilon,int *has_training_data,int *episode_score,int *survival_steps)`
 
 - **功能**：跑一整局训练（清空棋盘 → 逐步落子 → 直到顶出或输入耗尽）。
-- **输入**：输入流、追踪流、局号、`epsilon`、三个输出指针。
+- **输入**：输入流、局号、`epsilon`、三个输出指针。
 - **输出**：`1` 正常结束；`0` 生成动作或放置失败。
 - **注意**：开局读不到方块时直接返回 `1` 且 `*has_training_data=0`，主循环据此 `break`；奖励为 `score + 1.0`，顶出再扣 `300·exp(-(turn-1)/60)`；下一块读不到（`<0` 或 `==7`）也按终局处理。
 
-#### `int train_value_model(int episodes,const char *input_path,FILE *trace,int *completed_episodes,const char *test_path,FILE *evaluation_trace,int evaluation_interval)`
+#### `int train_value_model(int episodes,const char *input_path,int *completed_episodes,const char *test_path,int periodic_evaluation,int evaluation_interval)`
 
 - **功能**：训练主循环：初始化目标权重与回放区，按局调用 `train_value_episode`，处理周期评估与日志。
-- **输入**：总局数、输入路径（`NULL` 或 `"-"` 表示 `stdin`）、追踪流、输出实际完成局数、测试路径、测试追踪流、评估间隔。
+- **输入**：总局数、输入路径（`NULL` 或 `"-"` 表示 `stdin`）、输出实际完成局数、测试路径、是否做周期评估（由 main 按 `--eval-trace` 是否给出决定）、评估间隔。
 - **输出**：`1` 成功；`0` 打开输入失败、单局失败或周期评估失败。
 - **注意**：`srand(time(NULL))` 在这里播种子；每局重开输入文件（`stdin` 除外）；`epsilon = 0.35 - 0.30·episode/episodes`，下限 `0.05`；每 100 局打印一次窗口平均得分与步数。
 
@@ -953,14 +999,14 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 #### `int run_evaluation_episode(FILE *input,int step_limit,evaluation_result *result)`
 
 - **功能**：在某一片段上跑一局贪心评估。
-- **输入**：已 `fseek` 到片段起点的流、步数上限、输出结构（`score/survival_steps/top_out/features`）。
+- **输入**：已 `fseek` 到片段起点的流、步数上限、输出结构（`score/survival_steps/top_out`）。
 - **输出**：`1` 正常；`0` 无法生成或放置动作。
-- **注意**：`result->features` 是逐步 `normalize_feature` 之后的**求和**，不是平均（平均在 `evaluate_value_model` 里按总步数除）；顶出或达到 `step_limit` 立即停。
+- **注意**：顶出或达到 `step_limit` 立即停；评估用的归一化特征累加已经挪进追踪模块（`trace_accumulate_evaluation`），这里不再返回特征。
 
-#### `int evaluate_value_model(const char *path,const char *label,int sample_count,FILE *trace,int episode)`
+#### `int evaluate_value_model(const char *path,const char *label,int sample_count)`
 
-- **功能**：把测试文件按字节切成 `sample_count` 段，每段跑一局评估，汇总并打印、可选写追踪行。
-- **输入**：测试文件路径、报告标签（如"训练前测试"）、片段数、可空追踪流、写追踪用的局号。
+- **功能**：把测试文件按字节切成 `sample_count` 段，每段跑一局评估并汇总打印。
+- **输入**：测试文件路径、报告标签（如"训练前测试"）、片段数。
 - **输出**：`1` 成功；`0` 打不开、定位失败、文件为空、没有可用方块或写追踪失败。
 - **注意**：每段 `step_limit = min(segment_size, 500)`；切分按字节、不看方块边界，片段可能落在半个记录上；文件字节数小于 `sample_count` 时自动调小片段数。
 
@@ -975,7 +1021,7 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ## 附录 A 源码索引
 
-行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1229 行）。源码改动后请只更新这张表。
+行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1298 行）。源码改动后请只更新这张表。
 
 | 行号 | 内容 |
 | --- | --- |
@@ -1004,22 +1050,33 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 | 357–368 | `find_best_position` |
 | 370–419 | `load_value_model` |
 | 421–439 | `save_value_model` |
-| 441–450 | `write_training_trace_header` |
-| 452–461 | `write_evaluation_trace_header` |
-| 463–494 | `record_training_data` |
-| 496–507 | `DQN_*` / `EVALUATION_*` 常量 |
-| 509–514 | `replay_transition` |
-| 516–519 | 回放区与目标网络全局变量 |
-| 521–525 | `random_below` |
-| 527–620 | `update_dqn_batch` |
-| 622–626 | `add_replay_transition` |
-| 628–672 | `train_on_transition` |
-| 674–744 | `train_value_episode` |
-| 746–747 | `evaluate_value_model` 前置声明 |
-| 749–804 | `train_value_model` |
-| 806–811 | 评估统计结构体 |
-| 813–818 | `normalize_feature` |
-| 820–857 | `run_evaluation_episode` |
-| 859–946 | `evaluate_value_model` |
-| 948–986 | `run_game` |
-| 988–1229 | `main` |
+| 441–452 | `DQN_*` / `EVALUATION_*` 常量 |
+| 454–459 | `replay_transition` |
+| 461–464 | 回放区与目标网络全局变量 |
+| 466–470 | `random_below` |
+| 472–559 | `update_dqn_batch` |
+| 561–565 | `add_replay_transition` |
+| 567–579 | 数据追踪模块起始 banner 与说明 |
+| 580–581 | `trace_training_file` / `trace_evaluation_file` |
+| 583–586 | `trace_attach` |
+| 588–599 | `trace_write_training_header` |
+| 601–613 | `trace_write_evaluation_header` |
+| 615–620 | `trace_normalize_feature` |
+| 622–629 | `trace_count_board_cells` |
+| 631–650 | `trace_step_state` / `trace_step` |
+| 652–690 | `trace_begin_step` |
+| 692–722 | `trace_end_step` |
+| 724–727 | 评估追踪状态（局号、步数、特征累加） |
+| 729–734 | `trace_reset_evaluation` |
+| 736–743 | `trace_accumulate_evaluation` |
+| 745–769 | `trace_write_evaluation` |
+| 771 | 数据追踪模块结束 banner |
+| 773–789 | `train_on_transition` |
+| 791–858 | `train_value_episode` |
+| 860–861 | `evaluate_value_model` 前置声明 |
+| 863–919 | `train_value_model` |
+| 921–925 | 评估统计结构体 `evaluation_result` |
+| 927–958 | `run_evaluation_episode` |
+| 960–1024 | `evaluate_value_model` |
+| 1026–1064 | `run_game` |
+| 1066–1298 | `main` |

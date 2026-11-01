@@ -438,61 +438,6 @@ static int save_value_model(const char *path){
     return 1;
 }
 
-static int write_training_trace_header(FILE *trace){
-    if(fprintf(trace,
-               "episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,"
-               "current_value,next_value,target,td_error,feature_norm,board_cells")<0)return 0;
-    for(int i=0;i<FEATURE_COUNT;i++){
-        if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
-                   i,i,i,i,i)<0)return 0;
-    }
-    return fprintf(trace,"\n")>=0;
-}
-
-static int write_evaluation_trace_header(FILE *trace){
-    if(fprintf(trace,
-               "episode,games,mean_score,mean_survival_steps,top_out_rate")<0)
-        return 0;
-    for(int i=0;i<FEATURE_COUNT;i++){
-        if(fprintf(trace,",feature%d,weight%d,contribution%d",i,i,i)<0)
-            return 0;
-    }
-    return fprintf(trace,"\n")>=0;
-}
-
-static int record_training_data(FILE *trace,int episode,unsigned long long turn,int shape,
-                                const training_action *action,double epsilon,
-                                int score,double reward,int terminal,
-                                double current_value,double next_value,
-                                double target,double delta,double norm,
-                                int board_cells,
-                                const double before[FEATURE_COUNT],
-                                const double updates[FEATURE_COUNT],
-                                const double after[FEATURE_COUNT]){
-    if(!trace)return 1;
-    if(fprintf(trace,"%d,%llu,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
-                     "%.17g,%.17g,%.17g,%.17g,%.17g,%d",
-               episode,turn,shape,action->rotation,action->x,action->y,
-               epsilon,score,reward,terminal,current_value,next_value,
-               target,delta,norm,board_cells)<0){
-        fprintf(stderr,"写入训练追踪文件失败\n");
-        return 0;
-    }
-    for(int i=0;i<FEATURE_COUNT;i++){
-        if(fprintf(trace,",%.17g,%.17g,%.17g,%.17g,%.17g",
-                   action->features[i],before[i],
-                   before[i]*action->features[i],updates[i],after[i])<0){
-            fprintf(stderr,"写入训练追踪文件失败\n");
-            return 0;
-        }
-    }
-    if(fprintf(trace,"\n")<0){
-        fprintf(stderr,"写入训练追踪文件失败\n");
-        return 0;
-    }
-    return 1;
-}
-
 #define DQN_REPLAY_CAPACITY 50000
 #define DQN_BATCH_SIZE 32
 #define DQN_REPLAY_WARMUP 64
@@ -525,9 +470,7 @@ static int random_below(int upper_bound){
 }
 
 static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
-                            int batch_size,double alpha,double gamma,
-                            double updates[FEATURE_COUNT],
-                            double *mean_absolute_td){
+                            int batch_size,double alpha,double gamma){
     if(batch_size<1||batch_size>DQN_BATCH_SIZE){
         fprintf(stderr,"DQN 批次大小无效\n");
         return 0;
@@ -538,7 +481,6 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
     double grad_b1[HIDDEN_SIZE]={0.0};
     double grad_w1[HIDDEN_SIZE][FEATURE_COUNT];
     memset(grad_w1,0,sizeof(grad_w1));
-    *mean_absolute_td=0.0;
     for(int sample=0;sample<batch_size;sample++){
         const replay_transition *transition=&batch[sample];
         double current_value=score_features(value_weights,&hidden,
@@ -578,13 +520,11 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
                 grad_w1[h][j]+=upstream*
                     transition->action.features[j]*HIDDEN_INPUT_SCALE[j];
         }
-        *mean_absolute_td+=fabs(td_error);
     }
 
     double after[FEATURE_COUNT];
     for(int i=0;i<FEATURE_COUNT;i++){
-        updates[i]=alpha*gradients[i]/batch_size;
-        after[i]=value_weights[i]+updates[i];
+        after[i]=value_weights[i]+alpha*gradients[i]/batch_size;
         if(!isfinite(after[i])){
             fprintf(stderr,"DQN 权重数值异常：feature=%d\n",i);
             return 0;
@@ -609,7 +549,6 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
                 return 0;
             }
 
-    *mean_absolute_td/=batch_size;
     for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
     for(int h=0;h<HIDDEN_SIZE;h++){
         hidden.w2[h]+=delta_w2[h];
@@ -625,11 +564,97 @@ static void add_replay_transition(const replay_transition *transition){
     if(replay_size<DQN_REPLAY_CAPACITY)replay_size++;
 }
 
-static int train_on_transition(FILE *trace,int episode,
-                               unsigned long long turn,int shape,
-                               const training_action *action,double epsilon,
-                               int score,int board_cells,
-                               const replay_transition *transition){
+/* ==================================================================
+   数据追踪模块：与训练逻辑解耦，只读训练状态、只写 CSV
+   ------------------------------------------------------------------
+   训练代码里只有下面几处插桩（每处一行，不保留任何局部变量，
+   所有"为了写 CSV 才需要"的计算都锁在本模块内部）：
+     main / train_value_model : trace_attach() + 表头函数 + trace_reset_evaluation()
+     train_value_episode      : trace_begin_step(...) / trace_end_step()
+     run_evaluation_episode   : trace_accumulate_evaluation(&action)
+     evaluate_value_model     : trace_write_evaluation(...)
+   把本注释到"数据追踪模块结束"之间的代码整段删除，再删掉上述调用行，
+   训练与测试的行为、输出、随机数序列完全不变。
+   ================================================================== */
+
+static FILE *trace_training_file;
+static FILE *trace_evaluation_file;
+
+static void trace_attach(FILE *training,FILE *evaluation){
+    trace_training_file=training;
+    trace_evaluation_file=evaluation;
+}
+
+static int trace_write_training_header(void){
+    FILE *trace=trace_training_file;
+    if(!trace)return 1;
+    if(fprintf(trace,
+               "episode,turn,shape,rotation,x,y,epsilon,score,reward,terminal,"
+               "current_value,next_value,target,td_error,feature_norm,board_cells")<0)return 0;
+    for(int i=0;i<FEATURE_COUNT;i++){
+        if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
+                   i,i,i,i,i)<0)return 0;
+    }
+    return fprintf(trace,"\n")>=0;
+}
+
+static int trace_write_evaluation_header(void){
+    FILE *trace=trace_evaluation_file;
+    if(!trace)return 1;
+    if(fprintf(trace,
+               "episode,games,mean_score,mean_survival_steps,top_out_rate")<0)
+        return 0;
+    for(int i=0;i<FEATURE_COUNT;i++){
+        if(fprintf(trace,",feature%d,weight%d,contribution%d",i,i,i)<0)
+            return 0;
+    }
+    return fprintf(trace,"\n")>=0;
+}
+
+/* 评估追踪里的特征归一化：前两项按固定尺度，其余按棋盘占用格数 */
+static double trace_normalize_feature(int feature_index,double value,int board_cells){
+    if(feature_index==0)return value/20.0;
+    if(feature_index==1)return value/4.0;
+    if(board_cells<4)board_cells=4;
+    return value/board_cells;
+}
+
+static int trace_count_board_cells(void){
+    int cells=0;
+    for(int row=0;row<20;row++)
+        for(int column=0;column<10;column++)
+            cells+=board[row][column]!=0;
+    return cells;
+}
+
+/* 一步训练行所需的全部快照，begin 填好、end 写出 */
+typedef struct{
+    int active;
+    int episode;
+    unsigned long long turn;
+    int shape;
+    training_action action;
+    double epsilon;
+    int score;
+    double reward;
+    int terminal;
+    double current_value;
+    double next_value;
+    double target;
+    double td_error;
+    double norm;
+    int board_cells;
+    double before[FEATURE_COUNT];
+}trace_step_state;
+
+static trace_step_state trace_step;
+
+static int trace_begin_step(int episode,unsigned long long turn,int shape,
+                            const training_action *action,double epsilon,int score,
+                            const replay_transition *transition){
+    trace_step.active=0;
+    if(!trace_training_file)return 1;
+
     double current_value=action->value;
     double next_value=transition->terminal?0.0:
         score_features(target_weights,&target_hidden,transition->next_features);
@@ -645,17 +670,114 @@ static int train_on_transition(FILE *trace,int episode,
         return 0;
     }
 
+    trace_step.active=1;
+    trace_step.episode=episode;
+    trace_step.turn=turn;
+    trace_step.shape=shape;
+    trace_step.action=*action;
+    trace_step.epsilon=epsilon;
+    trace_step.score=score;
+    trace_step.reward=transition->reward;
+    trace_step.terminal=transition->terminal;
+    trace_step.current_value=current_value;
+    trace_step.next_value=next_value;
+    trace_step.target=target;
+    trace_step.td_error=td_error;
+    trace_step.norm=norm;
+    trace_step.board_cells=trace_count_board_cells();
+    memcpy(trace_step.before,value_weights,sizeof(trace_step.before));
+    return 1;
+}
+
+static int trace_end_step(void){
+    if(!trace_training_file||!trace_step.active)return 1;
+    trace_step.active=0;
+    if(fprintf(trace_training_file,
+               "%d,%llu,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
+               "%.17g,%.17g,%.17g,%.17g,%.17g,%d",
+               trace_step.episode,trace_step.turn,trace_step.shape,
+               trace_step.action.rotation,trace_step.action.x,
+               trace_step.action.y,trace_step.epsilon,trace_step.score,
+               trace_step.reward,trace_step.terminal,trace_step.current_value,
+               trace_step.next_value,trace_step.target,trace_step.td_error,
+               trace_step.norm,trace_step.board_cells)<0){
+        fprintf(stderr,"写入训练追踪文件失败\n");
+        return 0;
+    }
+    for(int i=0;i<FEATURE_COUNT;i++){
+        double delta=value_weights[i]-trace_step.before[i];
+        if(fprintf(trace_training_file,",%.17g,%.17g,%.17g,%.17g,%.17g",
+                   trace_step.action.features[i],trace_step.before[i],
+                   trace_step.before[i]*trace_step.action.features[i],
+                   delta,value_weights[i])<0){
+            fprintf(stderr,"写入训练追踪文件失败\n");
+            return 0;
+        }
+    }
+    if(fprintf(trace_training_file,"\n")<0){
+        fprintf(stderr,"写入训练追踪文件失败\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int trace_evaluation_active;
+static int trace_evaluation_episode;
+static double trace_evaluation_steps;
+static double trace_evaluation_features[FEATURE_COUNT];
+
+static void trace_reset_evaluation(int episode){
+    trace_evaluation_episode=episode;
+    trace_evaluation_active=trace_evaluation_file?1:0;
+    trace_evaluation_steps=0.0;
+    for(int i=0;i<FEATURE_COUNT;i++)trace_evaluation_features[i]=0.0;
+}
+
+static void trace_accumulate_evaluation(const training_action *action){
+    if(!trace_evaluation_active)return;
+    int board_cells=trace_count_board_cells();
+    for(int i=0;i<FEATURE_COUNT;i++)
+        trace_evaluation_features[i]+=
+            trace_normalize_feature(i,action->features[i],board_cells);
+    trace_evaluation_steps+=1.0;
+}
+
+static int trace_write_evaluation(int sample_count,double mean_score,
+                                  double mean_steps,double top_out_rate){
+    if(!trace_evaluation_file||!trace_evaluation_active)return 1;
+    trace_evaluation_active=0;
+    if(fprintf(trace_evaluation_file,"%d,%d,%.17g,%.17g,%.17g",
+               trace_evaluation_episode,sample_count,mean_score,mean_steps,
+               top_out_rate)<0){
+        fprintf(stderr,"写入测试追踪文件失败\n");
+        return 0;
+    }
+    for(int i=0;i<FEATURE_COUNT;i++){
+        double mean_feature=trace_evaluation_steps>0.0?
+            trace_evaluation_features[i]/trace_evaluation_steps:0.0;
+        if(fprintf(trace_evaluation_file,",%.17g,%.17g,%.17g",
+                   mean_feature,value_weights[i],
+                   mean_feature*value_weights[i])<0){
+            fprintf(stderr,"写入测试追踪文件失败\n");
+            return 0;
+        }
+    }
+    if(fprintf(trace_evaluation_file,"\n")<0){
+        fprintf(stderr,"写入测试追踪文件失败\n");
+        return 0;
+    }
+    return 1;
+}
+/* ------------------------ 数据追踪模块结束 ------------------------ */
+
+static int train_on_transition(const replay_transition *transition){
     add_replay_transition(transition);
-    double before[FEATURE_COUNT],after[FEATURE_COUNT],updates[FEATURE_COUNT];
-    memcpy(before,value_weights,sizeof(before));
-    for(int i=0;i<FEATURE_COUNT;i++)updates[i]=0.0;
     if(replay_size>=DQN_REPLAY_WARMUP){
         replay_transition batch[DQN_BATCH_SIZE];
         for(int i=0;i<DQN_BATCH_SIZE;i++)
             batch[i]=replay_buffer[random_below(replay_size)];
-        double mean_absolute_td=0.0;
         if(!update_dqn_batch(batch,DQN_BATCH_SIZE,DQN_LEARNING_RATE,
-                             DQN_GAMMA,updates,&mean_absolute_td))
+                             DQN_GAMMA))
             return 0;
         dqn_update_count++;
         if(dqn_update_count%DQN_TARGET_UPDATE_INTERVAL==0){
@@ -663,15 +785,10 @@ static int train_on_transition(FILE *trace,int episode,
             target_hidden=hidden;
         }
     }
-    memcpy(after,value_weights,sizeof(after));
-    return record_training_data(trace,episode,turn,shape,action,epsilon,score,
-                                transition->reward,transition->terminal,
-                                current_value,next_value,target,td_error,norm,
-                                board_cells,
-                                before,updates,after);
+    return 1;
 }
 
-static int train_value_episode(FILE *block_input,FILE *trace,int episode,
+static int train_value_episode(FILE *block_input,int episode,
                                double epsilon,int *has_training_data,
                                int *episode_score,int *survival_steps){
     memset(board,0,sizeof(board));
@@ -698,10 +815,6 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
             return 0;
         }
         clear_lines(full_rows,fill_line);
-        int board_cells=0;
-        for(int row=0;row<20;row++)
-            for(int column=0;column<10;column++)
-                board_cells+=board[row][column]!=0;
 
         int terminal=action.top_out;
         double reward=score+1.0;
@@ -731,9 +844,10 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
         }
         transition.terminal=terminal;
 
-        if(!train_on_transition(trace,episode,turn,shape,&action,epsilon,
-                                score,board_cells,&transition))
+        trace_begin_step(episode,turn,shape,&action,epsilon,score,&transition);
+        if(!train_on_transition(&transition))
             return 0;
+        trace_end_step();
         *episode_score+=score;
         *survival_steps=(int)turn;
         *has_training_data=1;
@@ -744,11 +858,11 @@ static int train_value_episode(FILE *block_input,FILE *trace,int episode,
 }
 
 static int evaluate_value_model(const char *path,const char *label,
-                                int sample_count,FILE *trace,int episode);
+                                int sample_count);
 
-static int train_value_model(int episodes,const char *input_path,FILE *trace,
+static int train_value_model(int episodes,const char *input_path,
                              int *completed_episodes,const char *test_path,
-                             FILE *evaluation_trace,int evaluation_interval){
+                             int periodic_evaluation,int evaluation_interval){
     srand((unsigned int)time(NULL));
     memcpy(target_weights,value_weights,sizeof(target_weights));
     replay_size=0;
@@ -771,7 +885,7 @@ static int train_value_model(int episodes,const char *input_path,FILE *trace,
         double epsilon=0.35-0.30*(double)episode/episodes;
         if(epsilon<0.05)epsilon=0.05;
         int has_training_data=0,episode_score=0,survival_steps=0;
-        int success=train_value_episode(block_input,trace,episode+1,epsilon,
+        int success=train_value_episode(block_input,episode+1,epsilon,
                                         &has_training_data,&episode_score,
                                         &survival_steps);
         if(block_input!=stdin&&fclose(block_input)!=0){
@@ -781,13 +895,14 @@ static int train_value_model(int episodes,const char *input_path,FILE *trace,
         if(!success)return 0;
         if(!has_training_data)break;
         (*completed_episodes)++;
-        if(test_path&&evaluation_trace&&
+        if(test_path&&periodic_evaluation&&
            *completed_episodes%evaluation_interval==0&&
-           *completed_episodes<episodes&&
-           !evaluate_value_model(test_path,"周期测试",
-                                 EVALUATION_SAMPLE_COUNT,evaluation_trace,
-                                 *completed_episodes))
-            return 0;
+           *completed_episodes<episodes){
+            trace_reset_evaluation(*completed_episodes);
+            if(!evaluate_value_model(test_path,"周期测试",
+                                     EVALUATION_SAMPLE_COUNT))
+                return 0;
+        }
         window_count++;
         window_score+=episode_score;
         window_steps+=survival_steps;
@@ -807,15 +922,7 @@ typedef struct{
     int score;
     int survival_steps;
     int top_out;
-    double features[FEATURE_COUNT];
 }evaluation_result;
-
-static double normalize_feature(int feature_index,double value,int board_cells){
-    if(feature_index==0)return value/20.0;
-    if(feature_index==1)return value/4.0;
-    if(board_cells<4)board_cells=4;
-    return value/board_cells;
-}
 
 static int run_evaluation_episode(FILE *input,int step_limit,
                                   evaluation_result *result){
@@ -839,13 +946,7 @@ static int run_evaluation_episode(FILE *input,int step_limit,
         clear_lines(full_rows,fill_line);
         result->score+=block_score;
         result->survival_steps++;
-        int board_cells=0;
-        for(int row=0;row<20;row++)
-            for(int column=0;column<10;column++)
-                board_cells+=board[row][column]!=0;
-        for(int i=0;i<FEATURE_COUNT;i++)
-            result->features[i]+=
-                normalize_feature(i,action.features[i],board_cells);
+        trace_accumulate_evaluation(&action);
         if(action.top_out){
             result->top_out=1;
             break;
@@ -857,7 +958,7 @@ static int run_evaluation_episode(FILE *input,int step_limit,
 }
 
 static int evaluate_value_model(const char *path,const char *label,
-                                int sample_count,FILE *trace,int episode){
+                                int sample_count){
     if(sample_count<1){
         fprintf(stderr,"测试采样局数必须大于零\n");
         return 0;
@@ -882,7 +983,6 @@ static int evaluate_value_model(const char *path,const char *label,
 
     double total_score=0.0,total_steps=0.0;
     int total_top_out=0;
-    double total_features[FEATURE_COUNT]={0.0};
     for(int sample=0;sample<sample_count;sample++){
         long segment_size=file_size/sample_count+
             (sample<file_size%sample_count);
@@ -904,8 +1004,6 @@ static int evaluate_value_model(const char *path,const char *label,
         total_score+=result.score;
         total_steps+=result.survival_steps;
         total_top_out+=result.top_out;
-        for(int i=0;i<FEATURE_COUNT;i++)
-            total_features[i]+=result.features[i];
     }
     if(fclose(input)!=0){
         fprintf(stderr,"关闭测试输入文件失败：%s\n",path);
@@ -919,29 +1017,9 @@ static int evaluate_value_model(const char *path,const char *label,
     double mean_score=total_score/sample_count;
     double mean_steps=total_steps/sample_count;
     double top_out_rate=100.0*total_top_out/sample_count;
-    double mean_features[FEATURE_COUNT];
-    for(int i=0;i<FEATURE_COUNT;i++)
-        mean_features[i]=total_features[i]/total_steps;
     printf("%s（%d 局，%s）：平均得分 %.2f，平均存活步数 %.2f，顶出率 %.1f%%\n",
            label,sample_count,path,mean_score,mean_steps,top_out_rate);
-    if(trace){
-        if(fprintf(trace,"%d,%d,%.17g,%.17g,%.17g",
-                   episode,sample_count,mean_score,mean_steps,top_out_rate)<0){
-            fprintf(stderr,"写入测试追踪文件失败\n");
-            return 0;
-        }
-        for(int i=0;i<FEATURE_COUNT;i++){
-            if(fprintf(trace,",%.17g,%.17g,%.17g",mean_features[i],
-                       value_weights[i],mean_features[i]*value_weights[i])<0){
-                fprintf(stderr,"写入测试追踪文件失败\n");
-                return 0;
-            }
-        }
-        if(fprintf(trace,"\n")<0){
-            fprintf(stderr,"写入测试追踪文件失败\n");
-            return 0;
-        }
-    }
+    if(!trace_write_evaluation(sample_count,mean_score,mean_steps,top_out_rate))return 0;
     return 1;
 }
 
@@ -1132,8 +1210,8 @@ int main(int argc,char **argv){
     }
 
     if(test_path&&!training){
-        return evaluate_value_model(test_path,"测试",EVALUATION_EPISODES,
-                                   NULL,0)?0:1;
+        trace_reset_evaluation(0);
+        return evaluate_value_model(test_path,"测试",EVALUATION_EPISODES)?0:1;
     }
 
     if(training){
@@ -1146,11 +1224,6 @@ int main(int argc,char **argv){
                 fprintf(stderr,"无法创建训练追踪文件 %s\n",trace_path);
                 return 1;
             }
-            if(!write_training_trace_header(trace)){
-                fprintf(stderr,"无法写入训练追踪文件表头 %s\n",trace_path);
-                fclose(trace);
-                return 1;
-            }
         }
         if(evaluation_trace_path){
             evaluation_trace=fopen(evaluation_trace_path,"w");
@@ -1160,36 +1233,37 @@ int main(int argc,char **argv){
                 if(trace)fclose(trace);
                 return 1;
             }
-            if(!write_evaluation_trace_header(evaluation_trace)){
-                fprintf(stderr,"无法写入测试追踪文件表头 %s\n",
-                        evaluation_trace_path);
-                fclose(evaluation_trace);
-                if(trace)fclose(trace);
-                return 1;
-            }
         }
+        trace_attach(trace,evaluation_trace);
+        if(!trace_write_training_header()||!trace_write_evaluation_header()){
+            fprintf(stderr,"无法写入追踪文件表头：%s / %s\n",trace_path,
+                    evaluation_trace_path?evaluation_trace_path:"（未启用）");
+            if(trace)fclose(trace);
+            if(evaluation_trace)fclose(evaluation_trace);
+            return 1;
+        }
+        trace_reset_evaluation(0);
         if(test_path&&
-           !evaluate_value_model(test_path,"训练前测试",EVALUATION_EPISODES,
-                                 evaluation_trace,0)){
+           !evaluate_value_model(test_path,"训练前测试",EVALUATION_EPISODES)){
             if(trace)fclose(trace);
             if(evaluation_trace)fclose(evaluation_trace);
             return 1;
         }
         int completed_episodes=0;
-        if(!train_value_model((int)episodes,input_path,trace,&completed_episodes,
-                              test_path,evaluation_trace,
+        if(!train_value_model((int)episodes,input_path,&completed_episodes,
+                              test_path,evaluation_trace_path!=NULL,
                               (int)evaluation_interval)){
             if(trace)fclose(trace);
             if(evaluation_trace)fclose(evaluation_trace);
             return 1;
         }
-        if(evaluation_trace&&completed_episodes>0&&
-           !evaluate_value_model(test_path,"训练后测试",
-                                 EVALUATION_EPISODES,evaluation_trace,
-                                 completed_episodes)){
-            if(trace)fclose(trace);
-            fclose(evaluation_trace);
-            return 1;
+        if(test_path&&completed_episodes>0){
+            trace_reset_evaluation(completed_episodes);
+            if(!evaluate_value_model(test_path,"训练后测试",EVALUATION_EPISODES)){
+                if(trace)fclose(trace);
+                if(evaluation_trace)fclose(evaluation_trace);
+                return 1;
+            }
         }
         if(trace&&fclose(trace)!=0){
             fprintf(stderr,"关闭训练追踪文件失败：%s\n",trace_path);
@@ -1212,11 +1286,6 @@ int main(int argc,char **argv){
             printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
         printf("隐藏层：%d 个 tanh 单元（残差连接，w2 全 0 时等价于线性模型）\n",
                HIDDEN_SIZE);
-        if(test_path&&!evaluation_trace_path&&
-           !evaluate_value_model(test_path,"训练后测试",
-                                 EVALUATION_EPISODES,NULL,
-                                 completed_episodes))
-            return 1;
         return 0;
     }
 

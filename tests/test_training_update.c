@@ -36,14 +36,12 @@ static void test_terminal_target_uses_only_reward(void){
     batch[0].terminal=1;
     batch[0].next_features[1]=100.0;
     target_weights[1]=100.0;
-    double updates[FEATURE_COUNT],mean_absolute_td=0.0;
 
-    if(!update_dqn_batch(batch,1,0.1,0.5,updates,&mean_absolute_td))
+    if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("terminal DQN update failed");
 
     expect_close(value_weights[0],0.5,"terminal reward update");
     expect_close(value_weights[1],0.0,"terminal target included bootstrap");
-    expect_close(mean_absolute_td,10.0,"terminal TD error");
     puts("PASS: terminal DQN target");
 }
 
@@ -55,14 +53,12 @@ static void test_bootstrap_target_updates_current_action(void){
     batch[0].next_features[1]=1.0;
     batch[0].reward=3.0;
     target_weights[1]=4.0;
-    double updates[FEATURE_COUNT],mean_absolute_td=0.0;
 
-    if(!update_dqn_batch(batch,1,0.1,0.5,updates,&mean_absolute_td))
+    if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("bootstrapped DQN update failed");
 
     expect_close(value_weights[0],0.2,"reward and bootstrap update");
     expect_close(value_weights[1],0.0,"update changed unrelated feature");
-    expect_close(mean_absolute_td,5.0,"bootstrapped TD error");
     puts("PASS: target-network bootstrap");
 }
 
@@ -73,13 +69,12 @@ static void test_huber_gradient_is_clipped(void){
     batch[0].action.features[0]=1.0;
     batch[0].reward=1000.0;
     batch[0].terminal=1;
-    double updates[FEATURE_COUNT],mean_absolute_td=0.0;
 
-    if(!update_dqn_batch(batch,1,0.1,0.5,updates,&mean_absolute_td))
+    if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("clipped DQN update failed");
 
+    /* TD=1000 若不被截断会得到 50，得到 5 说明梯度确实被截到 ±100 */
     expect_close(value_weights[0],5.0,"Huber gradient clip");
-    expect_close(mean_absolute_td,1000.0,"unclipped reported TD error");
     puts("PASS: Huber gradient clipping");
 }
 
