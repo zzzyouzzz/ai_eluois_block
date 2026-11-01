@@ -1,3 +1,13 @@
+"""训练追踪 CSV 的可视化分析。
+
+数据从哪来（见 eluose.c 开头的「参数配置区」）：
+   把 TRAINING_TRACE_PATH 改成 "training_trace.csv" 再重新编译，
+   然后照常 `eluose.exe --train -i 1.txt`，得到逐动作的训练追踪。
+
+用法：
+    python analyze_training.py training_trace.csv
+"""
+
 import argparse
 import csv
 import math
@@ -215,7 +225,7 @@ def plot_training(trace_path, episodes, rows, window, output_path):
         axes[1, 0].plot(
             episode_ids, weights[index], label=name, linewidth=1.2
         )
-    axes[1, 0].set_title("六个参数变化")
+    axes[1, 0].set_title("主干 6 个权重变化")
     axes[1, 0].set_xlabel("训练局数")
     axes[1, 0].set_ylabel("权重")
     axes[1, 0].set_yscale("symlog", linthresh=1)
@@ -283,154 +293,25 @@ def plot_training(trace_path, episodes, rows, window, output_path):
     plt.close(figure)
 
 
-def load_evaluation_trace(path):
-    required = {
-        "episode",
-        "mean_score",
-        "mean_survival_steps",
-        "top_out_rate",
-    }
-    required.update(f"feature{i}" for i in range(6))
-    required.update(f"weight{i}" for i in range(6))
-    required.update(f"contribution{i}" for i in range(6))
-    rows = []
-    with path.open("r", newline="", encoding="utf-8-sig") as file:
-        reader = csv.DictReader(file)
-        missing = required.difference(reader.fieldnames or [])
-        if missing:
-            raise SystemExit(
-                f"测试追踪缺少列：{', '.join(sorted(missing))}"
-            )
-        for row_number, row in enumerate(reader, start=2):
-            keys = [
-                "episode",
-                "mean_score",
-                "mean_survival_steps",
-                "top_out_rate",
-            ]
-            keys.extend(
-                f"{prefix}{i}"
-                for i in range(6)
-                for prefix in ("feature", "weight", "contribution")
-            )
-            values = {
-                key: parse_number(row, key, row_number) for key in keys
-            }
-            rows.append(values)
-    if not rows:
-        raise SystemExit(f"测试追踪中没有数据：{path}")
-    return rows
-
-
-def plot_evaluation(path, rows, window, output_path):
-    episodes = [row["episode"] for row in rows]
-    figure, axes = plt.subplots(3, 2, figsize=(16, 13), constrained_layout=True)
-    figure.suptitle(f"独立测试集评估：{path.name}")
-
-    axes[0, 0].plot(
-        episodes,
-        [row["mean_score"] for row in rows],
-        marker="o",
-        color="#1769aa",
-        label="平均得分",
-    )
-    axes[0, 0].set_title("测试集平均得分")
-    axes[0, 0].set_xlabel("训练局数（0 表示训练前）")
-    axes[0, 0].set_ylabel("平均得分")
-    axes[0, 0].legend(fontsize=8)
-    axes[0, 0].grid(alpha=0.25)
-
-    axes[0, 1].plot(
-        episodes,
-        [row["mean_survival_steps"] for row in rows],
-        marker="s",
-        color="#e67e22",
-        label="平均存活步数",
-    )
-    axes[0, 1].set_title("测试集平均存活步数")
-    axes[0, 1].set_xlabel("训练局数")
-    axes[0, 1].set_ylabel("步数（每段最多 500）")
-    axes[0, 1].legend(fontsize=8)
-    axes[0, 1].grid(alpha=0.25)
-
-    axes[1, 0].plot(
-        episodes,
-        [row["top_out_rate"] for row in rows],
-        marker="o",
-        color="#c62828",
-        label="顶出率",
-    )
-    axes[1, 0].set_title("测试集顶出率")
-    axes[1, 0].set_xlabel("训练局数")
-    axes[1, 0].set_ylabel("顶出率（%）")
-    axes[1, 0].legend(fontsize=8)
-    axes[1, 0].grid(alpha=0.25)
-
-    for index, name in enumerate(WEIGHT_NAMES):
-        axes[1, 1].plot(
-            episodes,
-            [row[f"weight{index}"] for row in rows],
-            marker="o",
-            label=name,
-        )
-    axes[1, 1].set_title("测试采样时的参数")
-    axes[1, 1].set_xlabel("训练局数")
-    axes[1, 1].set_ylabel("权重")
-    axes[1, 1].set_yscale("symlog", linthresh=1)
-    axes[1, 1].legend(ncol=2, fontsize=8)
-    axes[1, 1].grid(alpha=0.25)
-
-    for index, name in enumerate(FEATURE_NAMES):
-        values = rolling_mean(
-            [row[f"feature{index}"] for row in rows], window
-        )
-        axes[2, 0].plot(episodes, values, marker="o", label=name)
-    axes[2, 0].set_title("测试集归一化特征均值")
-    axes[2, 0].set_xlabel("训练局数")
-    axes[2, 0].set_ylabel("归一化特征值")
-    axes[2, 0].legend(ncol=2, fontsize=8)
-    axes[2, 0].grid(alpha=0.25)
-
-    for index, name in enumerate(FEATURE_NAMES):
-        values = rolling_mean(
-            [row[f"contribution{index}"] for row in rows], window
-        )
-        axes[2, 1].plot(episodes, values, marker="o", label=name)
-    axes[2, 1].axhline(0, color="black", linewidth=0.7, alpha=0.6)
-    axes[2, 1].set_title("测试集加权特征贡献")
-    axes[2, 1].set_xlabel("训练局数")
-    axes[2, 1].set_ylabel("平均价值贡献")
-    axes[2, 1].legend(ncol=2, fontsize=8)
-    axes[2, 1].grid(alpha=0.25)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=160)
-    plt.close(figure)
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="用中文图表分析俄罗斯方块线性 DQN 的训练与测试追踪。"
+        description=(
+            "用中文图表分析俄罗斯方块 DQN 的训练追踪。"
+            "追踪文件由 eluose.c 开头的「参数配置区」"
+            "（TRAINING_TRACE_PATH）控制。"
+        )
     )
     parser.add_argument("trace", nargs="?", default="training_trace.csv")
-    parser.add_argument(
-        "--eval-trace",
-        help="训练中周期测试生成的 CSV（由程序 --eval-trace 参数输出）。",
-    )
     parser.add_argument(
         "--output",
         default="training_analysis.png",
         help="训练图输出文件。",
     )
     parser.add_argument(
-        "--eval-output",
-        help="测试图输出文件；默认在训练图文件名后添加 _测试集。",
-    )
-    parser.add_argument(
         "--window",
         type=int,
         default=25,
-        help="滚动平均窗口大小，单位为训练局或测试采样点。",
+        help="滚动平均窗口大小，单位为训练局。",
     )
     args = parser.parse_args()
 
@@ -438,10 +319,11 @@ def main():
         parser.error("--window 必须大于零")
     trace_path = Path(args.trace)
     if not trace_path.is_file():
-        raise SystemExit(f"找不到训练追踪文件：{trace_path}")
-    evaluation_path = Path(args.eval_trace) if args.eval_trace else None
-    if evaluation_path and not evaluation_path.is_file():
-        raise SystemExit(f"找不到测试追踪文件：{evaluation_path}")
+        raise SystemExit(
+            f"找不到训练追踪文件：{trace_path}\n"
+            "生成方法：把 eluose.c 配置区里的 TRAINING_TRACE_PATH 改成 "
+            f'"{trace_path}"，重新编译后跑一次 `eluose.exe --train -i 1.txt`。'
+        )
 
     prepare_matplotlib()
     episodes, rows = load_training_trace(trace_path)
@@ -460,27 +342,6 @@ def main():
         f"平均存活步数："
         f"{sum(episodes[e]['steps'] for e in episode_ids) / len(episode_ids):.3f}"
     )
-
-    if evaluation_path:
-        eval_output = (
-            Path(args.eval_output)
-            if args.eval_output
-            else output_path.with_name(
-                f"{output_path.stem}_测试集{output_path.suffix or '.png'}"
-            )
-        )
-        evaluations = load_evaluation_trace(evaluation_path)
-        plot_evaluation(
-            evaluation_path, evaluations, args.window, eval_output
-        )
-        print(f"测试图：{eval_output}")
-        for row in evaluations:
-            print(
-                f"  训练至 {int(row['episode']):>5} 局："
-                f"测试均分 {row['mean_score']:.2f}，"
-                f"存活 {row['mean_survival_steps']:.2f} 步，"
-                f"顶出率 {row['top_out_rate']:.1f}%"
-            )
 
 
 if __name__ == "__main__":
