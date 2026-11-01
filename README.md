@@ -453,7 +453,7 @@ target        = terminal ? reward : reward + 0.99 * next_value
 
 - 每步按 epsilon-greedy 选择动作，执行落子和消行后保存 `features`、奖励、终局标志及下一方块的贪心动作特征。
 - 回放区达到 64 条经验后，每步随机抽取 32 条进行更新；每 500 次批量更新同步一次目标权重，学习率为 `0.0001`。
-- epsilon 随局数线性下降：`epsilon = 0.35 - 0.30 * episode / episodes`，下限 `0.05`。
+- epsilon 随局数线性下降：`epsilon = START + (END - START) * episode / episodes`，下限 `END`；`START` / `END` 取自配置区的 `TRAIN_EPSILON_START` / `TRAIN_EPSILON_END`（默认 `0.35` → `0.05`）。
 
 训练局数区间的平均得分与平均存活步数每 100 局输出一次。
 
@@ -480,7 +480,7 @@ score
 
 ### 2.11 参数配置区（文件开头）
 
-`eluose.c` 开头、`#include` 之后是一整块「参数配置区」，所有可调参数都集中在那里，改完重新编译即可，不再从命令行传。两组共 13 个宏：
+`eluose.c` 开头、`#include` 之后是一整块「参数配置区」，所有可调参数都集中在那里，改完重新编译即可，不再从命令行传。三组共 15 个宏：
 
 | 宏 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -496,6 +496,8 @@ score
 | `DQN_EARLY_END_PENALTY` / `DQN_EARLY_END_DECAY` | `300.0` / `60.0` | 顶出惩罚的幅度与衰减 |
 | `DQN_GAMMA` | `0.99` | 折扣因子 |
 | `DQN_LEARNING_RATE` | `0.0001` | 学习率 |
+| `TRAIN_EPSILON_START` | `0.35` | 每批 epsilon 的起点（可用 `-DTRAIN_EPSILON_START=0.15` 覆盖） |
+| `TRAIN_EPSILON_END` | `0.05` | 每批 epsilon 的终点，也是下限 |
 
 想追踪训练，把 `TRAINING_TRACE_PATH` 改成 `"training_trace.csv"` 再编译，然后照常 `eluose.exe --train -i .\1.txt`。想做一次"从头开始"的训练（例如换一组初值），把 `TRAIN_FRESH` 改成 `1`。
 
@@ -596,6 +598,32 @@ Get-Content .\3.txt | .\eluose.exe
 ```
 
 模型文件第一行是 `mlp 16`，其后每行一个浮点参数，共 135 行（主干 6 + 偏置 16 + 隐藏权重 96 + 输出权重 16）。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
+
+### 4.5 多批次实验脚本 `run_experiments.ps1`
+
+把"训练 N 局 → 跑一局贪心测试"重复若干批，模型在批与批之间延续，每批的测试得分记进 `test_scores.csv`。所有参数都在脚本开头：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `$TrainSet` / `$TestSet` | `.\1.txt` / `.\2.txt` | 训练集、测试集路径 |
+| `$EpisodesPerBatch` | `200` | 每批训练局数（编译时用 `-DTRAIN_EPISODES` 覆盖，不改源码） |
+| `$BatchCount` | `20` | 一共重复多少批 |
+| `$EpsilonStart` / `$EpsilonStep` / `$EpsilonEnd` | `0.35` / `0.05` / `0.05` | 首批 epsilon 起点、每批测试后下调的步长、下限 |
+| `$WorkDir` | `.\runs` | exe、模型、CSV 的工作目录 |
+
+**epsilon 逐批下调**：每批都按自己的起点重新编译（`-DTRAIN_EPSILON_START`），批内仍按原逻辑从起点线性降到 `TRAIN_EPSILON_END`；一批测试完就把下一批的起点减 `$EpsilonStep`，不低于 `$EpsilonEnd`。这样后一批是接着前一批的探索水平继续。若不做这件事，每次重启进程 epsilon 都会跳回 0.35，图上就是每 200 局一个完全相同的锯齿，跨批趋势全被它盖住。
+
+产物：
+
+- `test_scores.csv`：`batch,episodes,cum_episodes,epsilon_start,test_score,test_pieces,test_ms`。测试是**一局确定性的贪心对局**——策略贪心、输入固定，同一模型结果恒定；它衡量的是"这个模型在这条测试序列上能撑多久"，不是多局平均。`test_pieces` 就是这一局走了多少步，`test_score / test_pieces` 可用来分离"消行效率"与"存活长度"。
+- `trace_batchNNN.csv`：每批的训练追踪，出图时按顺序传入，局号会首尾相接。
+- `q_weights.dat`：持续更新的模型。
+
+出图：
+
+```powershell
+python .\analyze_training.py .\runs\trace_batch*.csv --test-log .\runs\test_scores.csv --output .\runs\analysis.png
+```
 
 ## 5. 常见问题与注意事项
 
@@ -949,7 +977,7 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 - **功能**：训练主循环：初始化目标权重与回放区，按局调用 `train_value_episode`。
 - **输入**：总局数（`TRAIN_EPISODES`）、输入路径（`NULL` 或 `"-"` 表示 `stdin`）、输出实际完成局数。
 - **输出**：`1` 成功；`0` 打开输入失败或单局失败。
-- **注意**：`srand(time(NULL))` 在这里播种子；每局重开输入文件（`stdin` 除外）；`epsilon = 0.35 - 0.30·episode/episodes`，下限 `0.05`。训练过程不打印进度（只有结束时一行 `训练完成：N 局`），得分与进度看追踪 CSV，或跑 `run_experiments.ps1` 得到的测试得分表。
+- **注意**：`srand(time(NULL))` 在这里播种子；每局重开输入文件（`stdin` 除外）；`epsilon` 从 `TRAIN_EPSILON_START` 线性降到 `TRAIN_EPSILON_END`（默认 `0.35` → `0.05`，后者同时是下限）。训练过程不打印进度（只有结束时一行 `训练完成：N 局`），得分与进度看追踪 CSV，或跑 `run_experiments.ps1` 得到的测试得分表。
 
 ### 7.7 入口
 
@@ -962,55 +990,55 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ## 附录 A 源码索引
 
-行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 995 行）。源码改动后请只更新这张表。
+行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1010 行）。源码改动后请只更新这张表。
 
 | 行号 | 内容 |
 | --- | --- |
-| 8–55 | 参数配置区：运行参数（`TRAIN_EPISODES` / `TRAIN_FRESH` / `VALUE_MODEL_PATH` / `TRAINING_TRACE_PATH`）与 `DQN_*` 全部宏 |
-| 56–108 | `block[7][4][4][2]` 七种方块的四个旋转格坐标 |
-| 109 | `board[25][15]` |
-| 110 | `FEATURE_COUNT` |
-| 111 | 初始 `value_weights` |
-| 113–130 | 隐藏层：注释、`HIDDEN_SIZE`、`hidden_layer` 类型、`hidden` / `target_hidden` / `target_weights`、`HIDDEN_INPUT_SCALE` |
-| 131 | `block_r` |
-| 132–140 | `block_w` |
-| 141–149 | `block_h` |
-| 150 | `can_place` 前置声明 |
-| 152–160 | `fill_hidden_w1` |
-| 161–171 | `reset_hidden_layer` |
-| 172–179 | `seed_hidden_layer` |
-| 180–186 | `reset_value_model` |
-| 187–221 | `place_block` |
-| 222–242 | `clear_lines` |
-| 243–249 | `remove_block` |
-| 250–260 | `can_place` |
-| 261–269 | `simulate_fall` |
-| 270–292 | `evaluate_board` |
-| 293–298 | `training_action` |
-| 299–306 | `hidden_unit_output` |
-| 307–315 | `score_features` |
-| 316–342 | `extract_action_features` |
-| 343–360 | `get_block` |
-| 361–405 | `generate_action` |
-| 406–418 | `find_best_position` |
-| 419–469 | `load_value_model` |
-| 470–491 | `save_value_model` |
-| 492–498 | `replay_transition` |
-| 499–502 | 回放区与目标网络全局变量 |
-| 504–509 | `random_below` |
-| 510–598 | `update_dqn_batch` |
-| 599–603 | `add_replay_transition` |
-| 604–615 | 数据追踪模块起始 banner 与说明 |
-| 616 | `trace_training_file` |
-| 618–621 | `trace_attach` |
-| 622–634 | `trace_write_training_header` |
-| 635–643 | `trace_count_board_cells` |
-| 644–663 | `trace_step_state` / `trace_step` |
-| 665–704 | `trace_begin_step` |
-| 705–736 | `trace_end_step` |
-| 737 | 数据追踪模块结束 banner |
-| 739–756 | `train_on_transition` |
-| 757–818 | `train_value_episode` |
-| 819–852 | `train_value_model` |
-| 853–892 | `run_game` |
-| 893–995 | `main` |
+| 8–68 | 参数配置区：运行参数（`TRAIN_EPISODES` / `TRAIN_FRESH` / `VALUE_MODEL_PATH` / `TRAINING_TRACE_PATH`）、`DQN_*`、探索（`TRAIN_EPSILON_START` / `TRAIN_EPSILON_END`） |
+| 69–121 | `block[7][4][4][2]` 七种方块的四个旋转格坐标 |
+| 122 | `board[25][15]` |
+| 123 | `FEATURE_COUNT` |
+| 124 | 初始 `value_weights` |
+| 126–143 | 隐藏层：注释、`HIDDEN_SIZE`、`hidden_layer` 类型、`hidden` / `target_hidden` / `target_weights`、`HIDDEN_INPUT_SCALE` |
+| 144 | `block_r` |
+| 145–153 | `block_w` |
+| 154–162 | `block_h` |
+| 163 | `can_place` 前置声明 |
+| 165–173 | `fill_hidden_w1` |
+| 174–184 | `reset_hidden_layer` |
+| 185–192 | `seed_hidden_layer` |
+| 193–199 | `reset_value_model` |
+| 200–234 | `place_block` |
+| 235–255 | `clear_lines` |
+| 256–262 | `remove_block` |
+| 263–273 | `can_place` |
+| 274–282 | `simulate_fall` |
+| 283–305 | `evaluate_board` |
+| 306–311 | `training_action` |
+| 312–319 | `hidden_unit_output` |
+| 320–328 | `score_features` |
+| 329–355 | `extract_action_features` |
+| 356–373 | `get_block` |
+| 374–418 | `generate_action` |
+| 419–431 | `find_best_position` |
+| 432–482 | `load_value_model` |
+| 483–504 | `save_value_model` |
+| 505–511 | `replay_transition` |
+| 512–515 | 回放区与目标网络全局变量 |
+| 517–522 | `random_below` |
+| 523–611 | `update_dqn_batch` |
+| 612–616 | `add_replay_transition` |
+| 617–628 | 数据追踪模块起始 banner 与说明 |
+| 629 | `trace_training_file` |
+| 631–634 | `trace_attach` |
+| 635–647 | `trace_write_training_header` |
+| 648–656 | `trace_count_board_cells` |
+| 657–676 | `trace_step_state` / `trace_step` |
+| 678–717 | `trace_begin_step` |
+| 718–749 | `trace_end_step` |
+| 750 | 数据追踪模块结束 banner |
+| 752–769 | `train_on_transition` |
+| 770–831 | `train_value_episode` |
+| 832–867 | `train_value_model` |
+| 868–906 | `run_game` |
+| 908–1010 | `main` |

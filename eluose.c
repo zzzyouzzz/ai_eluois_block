@@ -53,6 +53,19 @@
 #define DQN_GAMMA 0.99
 /* 学习率 */
 #define DQN_LEARNING_RATE 0.0001
+
+/* ---------- 探索（epsilon 退火） ---------- */
+
+/* 每局训练用的 epsilon 从 START 线性降到 END，END 同时是下限。
+   多批次实验可以逐批下调 START（run_experiments.ps1 就是这么做的），
+   从而让后一批"接着"前一批的探索水平，而不是每批重新探索一遍。 */
+#ifndef TRAIN_EPSILON_START
+#define TRAIN_EPSILON_START 0.35
+#endif
+#ifndef TRAIN_EPSILON_END
+#define TRAIN_EPSILON_END 0.05
+#endif
+
 const int block[7][4][4][2] = {
     // I型
     {
@@ -835,8 +848,10 @@ static int train_value_model(int episodes,const char *input_path,
             }
         }
 
-        double epsilon=0.35-0.30*(double)episode/episodes;
-        if(epsilon<0.05)epsilon=0.05;
+        double epsilon=TRAIN_EPSILON_START+
+                       (TRAIN_EPSILON_END-TRAIN_EPSILON_START)*
+                       (double)episode/episodes;
+        if(epsilon<TRAIN_EPSILON_END)epsilon=TRAIN_EPSILON_END;
         int has_training_data=0;
         int success=train_value_episode(block_input,episode+1,epsilon,&has_training_data);
         if(block_input!=stdin&&fclose(block_input)!=0){

@@ -11,6 +11,10 @@
     合计重复 $BatchCount 批。模型沿用已有 q_weights.dat（脚本会先把它复制到工作
     目录），每一批训练完都会覆盖它，所以后一批是在前一批的基础上继续训练。
 
+    epsilon 退火：每批按自己的起点重新编译（-DTRAIN_EPSILON_START），批内仍按
+    原逻辑从起点线性降到下限；一批测试完就把下一批的起点下调 $EpsilonStep，
+    这样后一批是接着前一批的探索水平继续，而不是每批重新探索一遍。
+
     训练追踪文件由 eluose.c 配置区里的 TRAINING_TRACE_PATH 决定（默认
     "training_trace.csv"，空串表示不追踪）。脚本按"这一批新出现的 CSV"来认领它，
     因此改不改文件名都能工作；若配置区关掉了追踪，脚本会给出警告、只记测试得分。
@@ -42,6 +46,11 @@ $EpisodesPerBatch = 200
 
 # 训练 → 测试 一共重复多少批
 $BatchCount = 20
+
+# epsilon 退火：第一批的起始 epsilon、每批测试后下调的步长、以及下限
+$EpsilonStart = 0.35
+$EpsilonStep  = 0.015
+$EpsilonEnd   = 0.05
 
 # 工作目录：exe、模型、CSV 都放这里
 $WorkDir = ".\runs"
@@ -87,17 +96,20 @@ $modelPath = Join-Path $workPath "q_weights.dat"
 Write-Host "训练集：$trainPath"
 Write-Host "测试集：$testPath"
 Write-Host "批次：$BatchCount × $EpisodesPerBatch 局"
+Write-Host ("epsilon：{0} → {1}，每批测试后 -{2}" -f $EpsilonStart, $EpsilonEnd, $EpsilonStep)
 Write-Host "工作目录：$workPath"
 
-# ---------- 1. 编译：只覆盖训练局数，其余沿用配置区 ----------
-Write-Host "`n编译中……"
-$build = Invoke-Captured $gcc @(
-    "-std=c99", "-O2",
-    "-DTRAIN_EPISODES=$EpisodesPerBatch",
-    (Join-Path $repo "eluose.c"), "-o", $exePath, "-lm")
-if ($build.ExitCode -ne 0) { throw "编译失败（gcc exit $($build.ExitCode)）：`n$($build.Output)" }
+# 工作目录里已有上一次实验的 CSV：整体挪进 archive_<时间>，避免追加到旧表、覆盖旧追踪
+$stale = @(Get-ChildItem -LiteralPath $workPath -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq "test_scores.csv" -or $_.Name -like "trace_batch*.csv" })
+if ($stale.Count -gt 0) {
+    $archive = Join-Path $workPath ("archive_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -ItemType Directory -Force -Path $archive | Out-Null
+    $stale | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $archive }
+    Write-Host ("上一次实验的 {0} 个 CSV 已移到：{1}" -f $stale.Count, $archive)
+}
 
-# ---------- 2. 沿用已有模型：仓库里的 q_weights.dat 首次运行时复制过来 ----------
+# ---------- 1. 沿用已有模型：仓库里的 q_weights.dat 首次运行时复制过来 ----------
 $repoModel = Join-Path $repo "q_weights.dat"
 if (-not (Test-Path -LiteralPath $modelPath) -and (Test-Path -LiteralPath $repoModel)) {
     Copy-Item -LiteralPath $repoModel -Destination $modelPath
@@ -107,18 +119,32 @@ if (-not (Test-Path -LiteralPath $modelPath)) {
     Write-Host "工作目录没有模型，将使用源码里的初始权重"
 }
 
-# ---------- 3. 循环：训练 → 测试 ----------
+# ---------- 2. 循环：编译（按本批 epsilon 起点）→ 训练 → 测试 ----------
 if (-not (Test-Path -LiteralPath $scoreCsv)) {
     [System.IO.File]::WriteAllText(
         $scoreCsv,
-        "batch,episodes,cum_episodes,test_score,test_pieces,test_ms`r`n",
+        "batch,episodes,cum_episodes,epsilon_start,test_score,test_pieces,test_ms`r`n",
         (New-Object System.Text.UTF8Encoding($false)))
 }
 
+$invariant = [System.Globalization.CultureInfo]::InvariantCulture
+$epsEndText = $EpsilonEnd.ToString("0.00", $invariant)
 $cumEpisodes = 0
+$currentEpsilon = $EpsilonStart
 for ($batch = 1; $batch -le $BatchCount; $batch++) {
     $label = "第 {0}/{1} 批" -f $batch, $BatchCount
-    Write-Host "`n$label：训练 $EpisodesPerBatch 局……"
+    $epsText = $currentEpsilon.ToString("0.00", $invariant)
+    Write-Host "`n$label：编译（epsilon 起点 $epsText）→ 训练 $EpisodesPerBatch 局……"
+
+    $build = Invoke-Captured $gcc @(
+        "-std=c99", "-O2",
+        "-DTRAIN_EPISODES=$EpisodesPerBatch",
+        "-DTRAIN_EPSILON_START=$epsText",
+        "-DTRAIN_EPSILON_END=$epsEndText",
+        (Join-Path $repo "eluose.c"), "-o", $exePath, "-lm")
+    if ($build.ExitCode -ne 0) {
+        throw "$label 编译失败（gcc exit $($build.ExitCode)）：`n$($build.Output)"
+    }
 
     $before = Get-CsvNames $workPath
     Push-Location -LiteralPath $workPath
@@ -167,12 +193,15 @@ for ($batch = 1; $batch -le $BatchCount; $batch++) {
     $testMs = 0
     if ($testOut -match "耗时：(\d+) ms") { $testMs = [int]$Matches[1] }
 
-    $line = "{0},{1},{2},{3},{4},{5}" -f $batch, $done, $cumEpisodes, $testScore, $testPieces, $testMs
+    $line = "{0},{1},{2},{3},{4},{5},{6}" -f $batch, $done, $cumEpisodes, $epsText, $testScore, $testPieces, $testMs
     [System.IO.File]::AppendAllText(
         $scoreCsv, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
 
-    Write-Host ("{0}：训练 {1} 局（累计 {2}），测试得分 {3}，落子 {4} 步，用时 {5} ms" -f
-        $label, $done, $cumEpisodes, $testScore, $testPieces, $testMs)
+    Write-Host ("{0}：epsilon 起点 {1}，训练 {2} 局（累计 {3}），测试得分 {4}，落子 {5} 步，用时 {6} ms" -f
+        $label, $epsText, $done, $cumEpisodes, $testScore, $testPieces, $testMs)
+
+    # 下一批接着这一批的探索水平继续：起点下调一点，但不低于下限
+    $currentEpsilon = [Math]::Max($EpsilonEnd, $currentEpsilon - $EpsilonStep)
 }
 
 Write-Host "`n全部完成。结果："
