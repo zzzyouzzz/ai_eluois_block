@@ -57,8 +57,9 @@
 /* ---------- 探索（epsilon 退火） ---------- */
 
 /* 每局训练用的 epsilon 从 START 线性降到 END，END 同时是下限。
-   多批次实验可以逐批下调 START（run_experiments.ps1 就是这么做的），
-   从而让后一批"接着"前一批的探索水平，而不是每批重新探索一遍。 */
+   第 0 局用 START，最后一局正好落在 END 上。run_experiments.ps1 把
+   上一批的 END 当成下一批的 START 传进来，于是 epsilon 跨批首尾相接、
+   整体平滑下降，而不是每批都重新从高处探索一遍。 */
 #ifndef TRAIN_EPSILON_START
 #define TRAIN_EPSILON_START 0.35
 #endif
@@ -848,9 +849,12 @@ static int train_value_model(int episodes,const char *input_path,
             }
         }
 
-        double epsilon=TRAIN_EPSILON_START+
-                       (TRAIN_EPSILON_END-TRAIN_EPSILON_START)*
-                       (double)episode/episodes;
+        /* 第 0 局用 START、最后一局正好用 END：上一批的 END 就是
+           下一批的 START，多批次实验里 epsilon 连成一条直线。 */
+        double epsilon=TRAIN_EPSILON_START;
+        if(episodes>1)
+            epsilon+=(TRAIN_EPSILON_END-TRAIN_EPSILON_START)*
+                     (double)episode/(double)(episodes-1);
         if(epsilon<TRAIN_EPSILON_END)epsilon=TRAIN_EPSILON_END;
         int has_training_data=0;
         int success=train_value_episode(block_input,episode+1,epsilon,&has_training_data);

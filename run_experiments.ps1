@@ -11,9 +11,10 @@
     合计重复 $BatchCount 批。模型沿用已有 q_weights.dat（脚本会先把它复制到工作
     目录），每一批训练完都会覆盖它，所以后一批是在前一批的基础上继续训练。
 
-    epsilon 退火：每批按自己的起点重新编译（-DTRAIN_EPSILON_START），批内仍按
-    原逻辑从起点线性降到下限；一批测试完就把下一批的起点下调 $EpsilonStep，
-    这样后一批是接着前一批的探索水平继续，而不是每批重新探索一遍。
+    epsilon 退火：整体从 $EpsilonStart 线性降到 $EpsilonEnd，跨所有批次平滑下降。
+    每一批都按自己那一段的起点/终点重新编译（-DTRAIN_EPSILON_START / _END），
+    批内按局号线性插值；上一批的终点就是下一批的起点，所以整条曲线首尾相接，
+    不会每批重新从高处探索一遍。
 
     训练追踪文件由 eluose.c 配置区里的 TRAINING_TRACE_PATH 决定（默认
     "training_trace.csv"，空串表示不追踪）。脚本按"这一批新出现的 CSV"来认领它，
@@ -23,6 +24,7 @@
       eluose.exe            按本批参数编译出来的可执行文件
       q_weights.dat         持续更新的模型
       trace_batchNNN.csv    每批的逐动作训练追踪
+      model_batchNNN.dat    该批测试时用的模型参数快照（135 行，可直接改名为 q_weights.dat 复盘）
       test_scores.csv       每批的测试得分
 
 .EXAMPLE
@@ -47,9 +49,8 @@ $EpisodesPerBatch = 200
 # 训练 → 测试 一共重复多少批
 $BatchCount = 20
 
-# epsilon 退火：第一批的起始 epsilon、每批测试后下调的步长、以及下限
+# epsilon 退火：整体从 $EpsilonStart 平滑降到 $EpsilonEnd，跨 $BatchCount 批分摊
 $EpsilonStart = 0.35
-$EpsilonStep  = 0.015
 $EpsilonEnd   = 0.05
 
 # 工作目录：exe、模型、CSV 都放这里
@@ -96,12 +97,13 @@ $modelPath = Join-Path $workPath "q_weights.dat"
 Write-Host "训练集：$trainPath"
 Write-Host "测试集：$testPath"
 Write-Host "批次：$BatchCount × $EpisodesPerBatch 局"
-Write-Host ("epsilon：{0} → {1}，每批测试后 -{2}" -f $EpsilonStart, $EpsilonEnd, $EpsilonStep)
+Write-Host ("epsilon：{0} → {1}，跨 {2} 批首尾相接" -f $EpsilonStart, $EpsilonEnd, $BatchCount)
 Write-Host "工作目录：$workPath"
 
 # 工作目录里已有上一次实验的 CSV：整体挪进 archive_<时间>，避免追加到旧表、覆盖旧追踪
 $stale = @(Get-ChildItem -LiteralPath $workPath -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq "test_scores.csv" -or $_.Name -like "trace_batch*.csv" })
+    Where-Object { $_.Name -eq "test_scores.csv" -or $_.Name -like "trace_batch*.csv" -or
+                   $_.Name -like "model_batch*.dat" })
 if ($stale.Count -gt 0) {
     $archive = Join-Path $workPath ("archive_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
     New-Item -ItemType Directory -Force -Path $archive | Out-Null
@@ -123,18 +125,29 @@ if (-not (Test-Path -LiteralPath $modelPath)) {
 if (-not (Test-Path -LiteralPath $scoreCsv)) {
     [System.IO.File]::WriteAllText(
         $scoreCsv,
-        "batch,episodes,cum_episodes,epsilon_start,test_score,test_pieces,test_ms`r`n",
+        "batch,episodes,cum_episodes,epsilon_start,epsilon_end,test_score,test_pieces,test_ms`r`n",
         (New-Object System.Text.UTF8Encoding($false)))
 }
 
 $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-$epsEndText = $EpsilonEnd.ToString("0.00", $invariant)
+$totalEpisodes = $BatchCount * $EpisodesPerBatch
 $cumEpisodes = 0
-$currentEpsilon = $EpsilonStart
+
+# 全局 epsilon 曲线：第 k 局训练（k 从 0 数起）用的 epsilon
+function Get-ScheduleEpsilon([double]$episodeIndex) {
+    if ($totalEpisodes -le 1) { return $EpsilonEnd }
+    $frac = $episodeIndex / $totalEpisodes
+    return $EpsilonStart + ($EpsilonEnd - $EpsilonStart) * $frac
+}
+
 for ($batch = 1; $batch -le $BatchCount; $batch++) {
     $label = "第 {0}/{1} 批" -f $batch, $BatchCount
-    $epsText = $currentEpsilon.ToString("0.00", $invariant)
-    Write-Host "`n$label：编译（epsilon 起点 $epsText）→ 训练 $EpisodesPerBatch 局……"
+    # 本批覆盖全局曲线的 [cumEpisodes, cumEpisodes + EpisodesPerBatch] 这一段
+    $batchStart = Get-ScheduleEpsilon $cumEpisodes
+    $batchEnd   = Get-ScheduleEpsilon ($cumEpisodes + $EpisodesPerBatch)
+    $epsText    = $batchStart.ToString("0.000", $invariant)
+    $epsEndText = $batchEnd.ToString("0.000", $invariant)
+    Write-Host "`n$label：编译（epsilon $epsText → $epsEndText）→ 训练 $EpisodesPerBatch 局……"
 
     $build = Invoke-Captured $gcc @(
         "-std=c99", "-O2",
@@ -173,6 +186,10 @@ for ($batch = 1; $batch -le $BatchCount; $batch++) {
         Write-Warning "$label 没有生成训练追踪文件（配置区 TRAINING_TRACE_PATH 可能是空串）"
     }
 
+    # 测试时用的就是这一批训练完的模型，留一份快照便于逐批复盘
+    $snapshot = Join-Path $workPath ("model_batch{0:d3}.dat" -f $batch)
+    Copy-Item -LiteralPath $modelPath -Destination $snapshot -Force
+
     Write-Host "$label：测试集跑一遍……"
     Push-Location -LiteralPath $workPath
     try {
@@ -193,20 +210,18 @@ for ($batch = 1; $batch -le $BatchCount; $batch++) {
     $testMs = 0
     if ($testOut -match "耗时：(\d+) ms") { $testMs = [int]$Matches[1] }
 
-    $line = "{0},{1},{2},{3},{4},{5},{6}" -f $batch, $done, $cumEpisodes, $epsText, $testScore, $testPieces, $testMs
+    $line = "{0},{1},{2},{3},{4},{5},{6},{7}" -f $batch, $done, $cumEpisodes, $epsText, $epsEndText, $testScore, $testPieces, $testMs
     [System.IO.File]::AppendAllText(
         $scoreCsv, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
 
-    Write-Host ("{0}：epsilon 起点 {1}，训练 {2} 局（累计 {3}），测试得分 {4}，落子 {5} 步，用时 {6} ms" -f
-        $label, $epsText, $done, $cumEpisodes, $testScore, $testPieces, $testMs)
-
-    # 下一批接着这一批的探索水平继续：起点下调一点，但不低于下限
-    $currentEpsilon = [Math]::Max($EpsilonEnd, $currentEpsilon - $EpsilonStep)
+    Write-Host ("{0}：epsilon {1} → {2}，训练 {3} 局（累计 {4}），测试得分 {5}，落子 {6} 步，用时 {7} ms" -f
+        $label, $epsText, $epsEndText, $done, $cumEpisodes, $testScore, $testPieces, $testMs)
 }
 
 Write-Host "`n全部完成。结果："
 Write-Host ("  测试得分表：{0}" -f $scoreCsv)
 Write-Host ("  训练追踪：  {0}\trace_batch*.csv" -f $workPath)
+Write-Host ("  模型快照：  {0}\model_batch*.dat" -f $workPath)
 Write-Host ("  模型：      {0}" -f $modelPath)
 Write-Host "`n出图命令："
 Write-Host ("  python .\analyze_training.py `"{0}\trace_batch*.csv`" --test-log `"{1}`" --output `"{2}`"" -f

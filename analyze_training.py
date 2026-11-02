@@ -188,6 +188,7 @@ def load_test_log(path):
                     "test_score": value("test_score"),
                     "test_pieces": value("test_pieces"),
                     "epsilon_start": value("epsilon_start"),
+                    "epsilon_end": value("epsilon_end"),
                 }
             )
     if not rows:
@@ -439,9 +440,10 @@ def main():
         print("测试批次：")
         for row in test_rows:
             eps = row.get("epsilon_start") or 0.0
+            eps_end = row.get("epsilon_end") or 0.0
             print(
                 f"  第 {row['batch']} 批（累计 {row['cum_episodes']} 局，"
-                f"epsilon 起点 {eps:.2f}）："
+                f"epsilon {eps:.3f} → {eps_end:.3f}）："
                 f"得分 {row['test_score']:.0f}，落子 {row['test_pieces']:.0f} 步"
             )
 
