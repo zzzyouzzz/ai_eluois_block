@@ -485,7 +485,7 @@ score
 | 宏 | 默认值 | 作用 |
 | --- | --- | --- |
 | `TRAIN_EPISODES` | `2000` | 训练局数 |
-| `TRAIN_FRESH` | `0` | `1` = 忽略已有模型、从源码里的初始权重开始；`0` = 接着 `VALUE_MODEL_PATH` 训练 |
+| `TRAIN_FRESH` | `0` | `1` = 忽略已有模型，从源码里的初始参数开始（主干 6 个数 + 隐藏层初值表）；`0` = 接着 `VALUE_MODEL_PATH` 训练 |
 | `VALUE_MODEL_PATH` | `"q_weights.dat"` | 模型文件名，读和写都用它 |
 | `TRAINING_TRACE_PATH` | `"training_trace.csv"` | 每步训练追踪 CSV；空串表示不追踪 |
 | `DQN_REPLAY_CAPACITY` | `50000` | 经验回放区容量 |
@@ -597,7 +597,7 @@ Get-Content .\3.txt | .\eluose.exe
 .\eluose.exe -i .\3.txt
 ```
 
-模型文件第一行是 `mlp 16`，其后每行一个浮点参数，共 135 行（主干 6 + 偏置 16 + 隐藏权重 96 + 输出权重 16）。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
+模型文件第一行是 `mlp 16`，其后每行一个浮点参数，共 135 行（主干 6 + 偏置 16 + 隐藏权重 96 + 输出权重 16）。**初始参数以这个文件为准**：改起点直接用文本编辑器改这 135 行（96 个 `w1` 按隐单元逐行排列，每行 6 个数对应 6 个特征）；源码里另有一份完全相同的初值表（`INITIAL_B1` / `INITIAL_W1` / `INITIAL_W2`），只在"没有模型文件"或 `TRAIN_FRESH=1` 时使用。源文件中的 `*.txt` 忽略规则不会忽略 `q_weights.dat`。
 
 ### 4.5 多批次实验脚本 `run_experiments.ps1`
 
@@ -881,26 +881,19 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 - **输出**：`1` 成功；`0` 打不开或 `fclose` 失败。
 - **注意**：每行 `%.12g`，共 135 行；会覆盖同名文件，不做备份。
 
-#### `void fill_hidden_w1(void)`
-
-- **功能**：给 `w1` 填确定性的、各单元互不相同的初值。
-- **输入**：无。
-- **输出**：无。
-- **注意**：16 个单元如果初值相同，梯度会一直相同，等于只训练了一个单元。
-
 #### `void reset_hidden_layer(void)`
 
-- **功能**：`w1` 重新取值、`b1` 与 `w2` 清零，并把 `hidden` 同步给 `target_hidden`。
+- **功能**：把 `hidden` 整体清零（`w1`、`b1`、`w2` 全为 0），并同步给 `target_hidden`。
 - **输入**：无。
 - **输出**：无。
-- **注意**：`w2=0` 时隐藏项恒为 0，`score_features` 退化成 6 项点积；测试里可以用它构造纯线性基准。
+- **注意**：清零后 `w2=0`，隐藏项恒为 0、`score_features` 退化成 6 项点积，模型等价于纯线性——`tests/test_training_update.c` 就是用它构造纯线性基准的。程序本身**不**走这条路径（见 `init_hidden_layer`）。
 
-#### `void seed_hidden_layer(void)`
+#### `void init_hidden_layer(void)`
 
-- **功能**：给 `b1`、`w2` 一点非零小初值，作为训练起点。
+- **功能**：把 `INITIAL_B1` / `INITIAL_W1` / `INITIAL_W2` 三张手写表装入 `hidden`，并同步给 `target_hidden`。
 - **输入**：无。
 - **输出**：无。
-- **注意**：`w2=0` 时 `∂Q/∂w1 ≡ 0`，表示部分永远学不动，所以 `TRAIN_FRESH=1` 训练开始前必须调它。
+- **注意**：这三张表与仓库里 `q_weights.dat` 的 128 个隐藏层参数逐位相同（已用"带文件/不带文件各跑一局 3.txt，得分与落子数完全一致"核对过）。`TRAIN_FRESH=1` 或找不到模型文件时走它，所以没有 `q_weights.dat` 也不会退化成"隐藏层全 0、只训练线性主干"。改初值有两个入口：改这里的表，或改 `q_weights.dat`（文件存在时以文件为准）。
 
 ### 7.5 数据追踪（可整段删除）
 
@@ -991,55 +984,57 @@ V(A_{t+1})  ←  max_{a'} [ r(A_{t+1}, a') + γ·V(A_{t+2}^{a'}) ]
 
 ## 附录 A 源码索引
 
-行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1014 行）。源码改动后请只更新这张表。
+行号对应本文写作时的 [`eluose.c`](./eluose.c)（共 1042 行）。源码改动后请只更新这张表。
 
 | 行号 | 内容 |
 | --- | --- |
-| 8–68 | 参数配置区：运行参数（`TRAIN_EPISODES` / `TRAIN_FRESH` / `VALUE_MODEL_PATH` / `TRAINING_TRACE_PATH`）、`DQN_*`、探索（`TRAIN_EPSILON_START` / `TRAIN_EPSILON_END`） |
-| 70–121 | `block[7][4][4][2]` 七种方块的四个旋转格坐标 |
-| 123 | `board[25][15]` |
-| 124 | `FEATURE_COUNT` |
-| 125 | 初始 `value_weights` |
-| 127–143 | 隐藏层：`HIDDEN_SIZE`、`hidden_layer` 类型、`hidden` / `target_hidden` / `target_weights`、`HIDDEN_INPUT_SCALE` |
-| 145 | `block_r` |
-| 146–153 | `block_w` |
-| 155–162 | `block_h` |
-| 164 | `can_place` 前置声明 |
-| 168–173 | `fill_hidden_w1` |
-| 175–184 | `reset_hidden_layer` |
-| 186–192 | `seed_hidden_layer` |
-| 194–199 | `reset_value_model` |
-| 201–234 | `place_block` |
-| 236–255 | `clear_lines` |
-| 257–262 | `remove_block` |
-| 264–273 | `can_place` |
-| 275–282 | `simulate_fall` |
-| 284–305 | `evaluate_board` |
-| 307–311 | `training_action` |
-| 313–319 | `hidden_unit_output` |
-| 321–328 | `score_features` |
-| 330–355 | `extract_action_features` |
-| 357–373 | `get_block` |
-| 375–418 | `generate_action` |
-| 420–431 | `find_best_position` |
-| 433–482 | `load_value_model` |
-| 484–504 | `save_value_model` |
-| 506–511 | `replay_transition` |
-| 513–516 | 回放区、批量更新计数等全局变量 |
-| 518–522 | `random_below` |
-| 524–611 | `update_dqn_batch` |
-| 613–616 | `add_replay_transition` |
-| 618–628 | 数据追踪模块起始 banner 与说明 |
-| 630 | `trace_training_file` |
-| 632–634 | `trace_attach` |
-| 636–647 | `trace_write_training_header` |
-| 649–656 | `trace_count_board_cells` |
-| 658–677 | `trace_step_state` / `trace_step` |
-| 679–717 | `trace_begin_step` |
-| 719–749 | `trace_end_step` |
-| 751 | 数据追踪模块结束 banner |
-| 753–769 | `train_on_transition` |
-| 771–831 | `train_value_episode` |
-| 833–870 | `train_value_model`（含 epsilon 退火） |
-| 872–910 | `run_game` |
-| 912–1014 | `main` |
+| 8–70 | 参数配置区：运行参数（`TRAIN_EPISODES` / `TRAIN_FRESH` / `VALUE_MODEL_PATH` / `TRAINING_TRACE_PATH`）、`DQN_*`、探索（`TRAIN_EPSILON_START` / `TRAIN_EPSILON_END`） |
+| 72–123 | `block[7][4][4][2]` 七种方块的四个旋转格坐标 |
+| 125 | `board[25][15]` |
+| 126 | `FEATURE_COUNT` |
+| 127 | 初始 `value_weights` |
+| 129–145 | 隐藏层：`HIDDEN_SIZE`、`hidden_layer` 类型、`hidden` / `target_hidden` / `target_weights`、`HIDDEN_INPUT_SCALE` |
+| 147 | `block_r` |
+| 148–155 | `block_w` |
+| 157–164 | `block_h` |
+| 166 | `can_place` 前置声明 |
+| 168–175 | `INITIAL_B1`：手写的 16 个偏置初值 |
+| 177–194 | `INITIAL_W1`：手写的 16×6 隐藏层初值（每行一个隐单元） |
+| 196–199 | `INITIAL_W2`：手写的 16 个输出权重初值 |
+| 201–205 | `reset_hidden_layer`（清零，测试用它构造纯线性基准） |
+| 207–213 | `init_hidden_layer`（装入上面的三张初值表） |
+| 215–220 | `reset_value_model` |
+| 222–255 | `place_block` |
+| 257–276 | `clear_lines` |
+| 278–283 | `remove_block` |
+| 285–294 | `can_place` |
+| 296–303 | `simulate_fall` |
+| 305–326 | `evaluate_board` |
+| 328–332 | `training_action` |
+| 334–340 | `hidden_unit_output` |
+| 342–349 | `score_features` |
+| 351–376 | `extract_action_features` |
+| 378–394 | `get_block` |
+| 396–439 | `generate_action` |
+| 441–452 | `find_best_position` |
+| 454–503 | `load_value_model` |
+| 505–525 | `save_value_model` |
+| 527–532 | `replay_transition` |
+| 534–537 | 回放区、批量更新计数等全局变量 |
+| 539–543 | `random_below` |
+| 545–632 | `update_dqn_batch` |
+| 634–637 | `add_replay_transition` |
+| 639–649 | 数据追踪模块起始 banner 与说明 |
+| 651 | `trace_training_file` |
+| 653–655 | `trace_attach` |
+| 657–668 | `trace_write_training_header` |
+| 670–677 | `trace_count_board_cells` |
+| 679–698 | `trace_step_state` / `trace_step` |
+| 700–738 | `trace_begin_step` |
+| 740–770 | `trace_end_step` |
+| 772 | 数据追踪模块结束 banner |
+| 774–790 | `train_on_transition` |
+| 792–852 | `train_value_episode` |
+| 854–891 | `train_value_model`（含 epsilon 退火） |
+| 893–931 | `run_game` |
+| 933–1042 | `main` |

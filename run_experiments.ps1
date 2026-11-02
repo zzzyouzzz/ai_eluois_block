@@ -17,8 +17,9 @@
     不会每批重新从高处探索一遍。
 
     训练追踪文件由 eluose.c 配置区里的 TRAINING_TRACE_PATH 决定（默认
-    "training_trace.csv"，空串表示不追踪）。脚本按"这一批新出现的 CSV"来认领它，
-    因此改不改文件名都能工作；若配置区关掉了追踪，脚本会给出警告、只记测试得分。
+    "training_trace.csv"，空串表示不追踪）。脚本按"这一批训练开始后被改写过的
+    CSV"来认领它，因此改不改文件名都能工作，上一次实验遗留的同名文件也不会让
+    认领失败；若配置区关掉了追踪，脚本会给出警告、只记测试得分。
 
     产物都在工作目录（默认 .\runs）里：
       eluose.exe            按本批参数编译出来的可执行文件
@@ -79,12 +80,6 @@ function Invoke-Captured([string]$exe, [string[]]$arguments) {
     }
 }
 
-# 列出工作目录里的 CSV 文件名（用于识别这一批新生成的追踪文件）
-function Get-CsvNames([string]$dir) {
-    return @(Get-ChildItem -LiteralPath $dir -Filter *.csv -File -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.Name })
-}
-
 $trainPath = Get-FullPath $TrainSet "训练集"
 $testPath  = Get-FullPath $TestSet  "测试集"
 $workPath  = if ([System.IO.Path]::IsPathRooted($WorkDir)) { $WorkDir } else { Join-Path $repo $WorkDir }
@@ -101,9 +96,9 @@ Write-Host ("epsilon：{0} → {1}，跨 {2} 批首尾相接" -f $EpsilonStart, 
 Write-Host "工作目录：$workPath"
 
 # 工作目录里已有上一次实验的 CSV：整体挪进 archive_<时间>，避免追加到旧表、覆盖旧追踪
+# 注意要把训练追踪文件（默认 training_trace.csv）也挪走，否则这一批会把它误当成"旧文件"
 $stale = @(Get-ChildItem -LiteralPath $workPath -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq "test_scores.csv" -or $_.Name -like "trace_batch*.csv" -or
-                   $_.Name -like "model_batch*.dat" })
+    Where-Object { $_.Name -like "*.csv" -or $_.Name -like "model_batch*.dat" })
 if ($stale.Count -gt 0) {
     $archive = Join-Path $workPath ("archive_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
     New-Item -ItemType Directory -Force -Path $archive | Out-Null
@@ -118,7 +113,7 @@ if (-not (Test-Path -LiteralPath $modelPath) -and (Test-Path -LiteralPath $repoM
     Write-Host "已复制仓库模型作为起点：$repoModel"
 }
 if (-not (Test-Path -LiteralPath $modelPath)) {
-    Write-Host "工作目录没有模型，将使用源码里的初始权重"
+    Write-Host "工作目录没有模型：将从源码里的初始参数开始（与 q_weights.dat 相同）"
 }
 
 # ---------- 2. 循环：编译（按本批 epsilon 起点）→ 训练 → 测试 ----------
@@ -159,7 +154,7 @@ for ($batch = 1; $batch -le $BatchCount; $batch++) {
         throw "$label 编译失败（gcc exit $($build.ExitCode)）：`n$($build.Output)"
     }
 
-    $before = Get-CsvNames $workPath
+    $trainStart = Get-Date
     Push-Location -LiteralPath $workPath
     try {
         $run = Invoke-Captured $exePath @("--train", "-i", $trainPath)
@@ -174,10 +169,15 @@ for ($batch = 1; $batch -le $BatchCount; $batch++) {
     if ($done -le 0) { throw "$label 没有完成任何训练局：`n$trainOut" }
     $cumEpisodes += $done
 
-    # 这一批新生成的追踪 CSV 就是本次训练的追踪
-    $fresh = @(Get-CsvNames $workPath | Where-Object {
-        $_ -ne "test_scores.csv" -and $before -notcontains $_
-    })
+    # 训练会就地写 TRAINING_TRACE_PATH（默认 training_trace.csv）。用"这批训练开始后
+    # 被改写过的 CSV"来认领它，比"新出现的文件"稳妥：上一次实验遗留的同名文件不会
+    # 再让这一批认领失败（否则每批都在原地覆盖，一个 trace_batchNNN 都留不下）。
+    $fresh = @(Get-ChildItem -LiteralPath $workPath -Filter *.csv -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -ge $trainStart.AddSeconds(-1) -and
+            $_.Name -ne "test_scores.csv" -and
+            $_.Name -notlike "trace_batch*.csv"
+        } | ForEach-Object { $_.Name })
     $savedTrace = Join-Path $workPath ("trace_batch{0:d3}.csv" -f $batch)
     if ($fresh.Count -ge 1) {
         $sourceTrace = Join-Path $workPath $fresh[0]

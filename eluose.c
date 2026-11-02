@@ -21,7 +21,9 @@
 #ifndef TRAIN_EPISODES
 #define TRAIN_EPISODES 2000
 #endif
-/* 是否忽略已保存的模型、从源码里的初始权重开始训练：1 = 忽略，0 = 沿用 */
+/* 是否忽略已保存的模型、从源码里的初始值开始训练：1 = 忽略，0 = 沿用
+   模型文件。注意初始参数（含 w1/w2）写在 q_weights.dat 里，选 1 时那份
+   文件不会被读取，隐藏层从 0 开始（等价纯线性）。 */
 #ifndef TRAIN_FRESH
 #define TRAIN_FRESH 0
 #endif
@@ -163,31 +165,50 @@ int block_h[7][4]={
 };
 int can_place(int shape,int rotation,int x,int y);
 
-/* w1 用确定性"哈希"散布，保证 16 个隐单元互不相同；
-   如果所有隐单元初值相同，它们的梯度会一直相同，等于只训练了一个单元。 */
-static void fill_hidden_w1(void){
-    for(int h=0;h<HIDDEN_SIZE;h++)
-        for(int j=0;j<FEATURE_COUNT;j++)
-            hidden.w1[h][j]=0.5*(double)(((h*13+j*7)%29)-14)/14.0;
-}
+/* 隐藏层的初始参数：手写的 16 个偏置 + 16×6 权重 + 16 个输出权重，
+   与仓库里 q_weights.dat 的 128 个数逐位相同。写死在源码里，是为了让
+   "没有模型文件"也能从有意义的初值起步，而不是隐藏层全 0。
+   每个隐单元主盯一个特征（0.30 / 0.24 / 0.18 三档），再对另一个特征取 -0.10。
+   想改初值：改这里，或者改 q_weights.dat（文件存在时以文件为准）。 */
+static const double INITIAL_B1[HIDDEN_SIZE]={
+    0.0, 0.1, -0.1, 0.05, -0.05, 0.1, -0.1, 0.05,
+    -0.05, 0.1, -0.1, 0.05, -0.05, 0.1, -0.1, 0.05
+};
+static const double INITIAL_W1[HIDDEN_SIZE][FEATURE_COUNT]={
+    /*            高度   消行   行变化  列变化  洞数   井深 */
+    { 0.30, -0.10,  0.00,  0.00,  0.00,  0.00},   /*  0 高度 */
+    { 0.00,  0.30,  0.00,  0.00, -0.10,  0.00},   /*  1 消行 */
+    { 0.00, -0.10,  0.30,  0.00,  0.00,  0.00},   /*  2 行变化 */
+    { 0.00,  0.00,  0.00,  0.30, -0.10,  0.00},   /*  3 列变化 */
+    { 0.00, -0.10,  0.00,  0.00,  0.30,  0.00},   /*  4 洞数 */
+    { 0.00,  0.00,  0.00,  0.00, -0.10,  0.30},   /*  5 井深 */
+    { 0.24, -0.10,  0.00,  0.00,  0.00,  0.00},   /*  6 高度（弱） */
+    { 0.00,  0.24,  0.00,  0.00, -0.10,  0.00},   /*  7 消行（弱） */
+    { 0.00, -0.10,  0.24,  0.00,  0.00,  0.00},   /*  8 行变化（弱） */
+    { 0.00,  0.00,  0.00,  0.24, -0.10,  0.00},   /*  9 列变化（弱） */
+    { 0.00, -0.10,  0.00,  0.00,  0.24,  0.00},   /* 10 洞数（弱） */
+    { 0.00,  0.00,  0.00,  0.00, -0.10,  0.24},   /* 11 井深（弱） */
+    { 0.18, -0.10,  0.00,  0.00,  0.00,  0.00},   /* 12 高度（更弱） */
+    { 0.00,  0.18,  0.00,  0.00, -0.10,  0.00},   /* 13 消行（更弱） */
+    { 0.00, -0.10,  0.18,  0.00,  0.00,  0.00},   /* 14 行变化（更弱） */
+    { 0.00,  0.00,  0.00,  0.18, -0.10,  0.00}    /* 15 列变化（更弱） */
+};
+static const double INITIAL_W2[HIDDEN_SIZE]={
+    0.02, -0.02, 0.015, -0.015, 0.02, -0.02, 0.015, -0.015,
+    0.02, -0.02, 0.015, -0.015, 0.02, -0.02, 0.015, -0.015
+};
 
-/* 隐藏层重置为"不改变输出"的状态：w2 全 0 时 Q 严格等于线性主干 */
+/* 清零：w2=0 时 Q 严格等于线性主干（测试里用它构造纯线性基准） */
 static void reset_hidden_layer(void){
-    fill_hidden_w1();
-    for(int h=0;h<HIDDEN_SIZE;h++){
-        hidden.b1[h]=0.0;
-        hidden.w2[h]=0.0;
-    }
+    memset(&hidden,0,sizeof(hidden));
     target_hidden=hidden;
 }
 
-/* 训练起点：w2 必须给一点非零初值。
-   w2=0 时 dQ/dw1 恒为 0，隐藏层的表示部分永远学不动（死初始化）。 */
-static void seed_hidden_layer(void){
-    for(int h=0;h<HIDDEN_SIZE;h++){
-        hidden.b1[h]=0.05*(double)(((h*5)%7)-3)/3.0;
-        hidden.w2[h]=0.02*(double)(((h*3)%5)-2)/2.0;
-    }
+/* 装入源码里的初始参数；模型文件不存在、或 TRAIN_FRESH=1 时走这里 */
+static void init_hidden_layer(void){
+    memcpy(hidden.b1,INITIAL_B1,sizeof(hidden.b1));
+    memcpy(hidden.w1,INITIAL_W1,sizeof(hidden.w1));
+    memcpy(hidden.w2,INITIAL_W2,sizeof(hidden.w2));
     target_hidden=hidden;
 }
 
@@ -195,7 +216,7 @@ static void reset_value_model(void){
     const double initial_weights[FEATURE_COUNT]=
         {-45.0,34.0,-32.0,-93.0,-79.0,-34.0};
     memcpy(value_weights,initial_weights,sizeof(value_weights));
-    reset_hidden_layer();
+    init_hidden_layer();
 }
 
 int place_block(int shape,int rotation,int x,int y,int fill[4],
@@ -956,17 +977,24 @@ int main(int argc,char **argv){
             return 1;
         }
     }
-    if(!fresh_model&&load_value_model(VALUE_MODEL_PATH)<0){
-        if(input!=stdin)fclose(input);
-        return 1;
-    }
     if(fresh_model){
         reset_value_model();
-        printf("使用源码中的初始权重（线性主干 + 隐藏层）\n");
+        printf("从源码里的初始参数开始（主干 6 个数 + 隐藏层初值，与 %s 相同）\n",
+               VALUE_MODEL_PATH);
+    }else{
+        int loaded=load_value_model(VALUE_MODEL_PATH);
+        if(loaded<0){
+            if(input!=stdin)fclose(input);
+            return 1;
+        }
+        if(loaded==0){
+            /* 没有模型文件：用源码里的同一组初值，隐藏层也不会退化成全 0 */
+            init_hidden_layer();
+            printf("找不到模型文件 %s，从源码里的初始参数开始\n",VALUE_MODEL_PATH);
+        }
     }
 
     if(training){
-        if(fresh_model)seed_hidden_layer();
         FILE *trace=NULL;
         if(TRAINING_TRACE_PATH[0]){
             trace=fopen(TRAINING_TRACE_PATH,"w");
