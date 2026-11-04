@@ -451,9 +451,9 @@ static int load_value_model(const char *path){
     }
     double loaded[FEATURE_COUNT];
     double loaded_bias=0.0;
-    char tag[16];
+    char tag[64];
     int ok=0;
-    if(fscanf(fp,"%15s",tag)!=1){
+    if(fscanf(fp,"%63s",tag)!=1){
         fprintf(stderr,"价值模型格式错误：%s\n",path);
         fclose(fp);
         return -1;
