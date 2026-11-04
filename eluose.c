@@ -49,8 +49,25 @@
 #define DQN_HUBER_DELTA 100.0
 /* 折扣因子 */
 #define DQN_GAMMA 0.99
-/* 学习率 */
-#define DQN_LEARNING_RATE 0.0001
+/* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
+#ifndef DQN_LEARNING_RATE
+#define DQN_LEARNING_RATE 0.005
+#endif
+/* 奖励缩放：棋盘上的消行分 0/100/300/500/800 乘这个系数才是训练奖励，
+   0.01 即奖励变成 0~8，TD 和梯度的量级同步缩小 100 倍。 */
+#ifndef REWARD_SCALE
+#define REWARD_SCALE 0.01
+#endif
+/* Adam 的超参 */
+#ifndef ADAM_BETA1
+#define ADAM_BETA1 0.9
+#endif
+#ifndef ADAM_BETA2
+#define ADAM_BETA2 0.999
+#endif
+#ifndef ADAM_EPSILON
+#define ADAM_EPSILON 1e-8
+#endif
 
 /* ---------- 探索（epsilon 退火） ---------- */
 
@@ -129,6 +146,23 @@ double value_bias = 0.0;
 static double target_weights[FEATURE_COUNT];
 static double target_bias = 0.0;
 
+/* Adam 的状态：一阶矩、二阶矩和步数。
+   Adam 对每个参数单独自适应步长，所以不需要再按 1+Σφ² 除梯度，
+   特征之间量级差十倍也不会把某个权重按死。 */
+static double adam_m[FEATURE_COUNT];
+static double adam_v[FEATURE_COUNT];
+static double adam_m_bias = 0.0;
+static double adam_v_bias = 0.0;
+static long long adam_step = 0;
+
+static void reset_adam_state(void){
+    memset(adam_m,0,sizeof(adam_m));
+    memset(adam_v,0,sizeof(adam_v));
+    adam_m_bias = 0.0;
+    adam_v_bias = 0.0;
+    adam_step = 0;
+}
+
 int block_r[7]={2,4,1,4,4,2,2};//每个方块的旋转数
 int block_w[7][4]={
     {3,0,3,0},
@@ -155,6 +189,7 @@ static void reset_value_model(void){
         {-45.0,34.0,-32.0,-93.0,-79.0,-34.0};
     memcpy(value_weights,initial_weights,sizeof(value_weights));
     value_bias=0.0;
+    reset_adam_state();
 }
 
 int place_block(int shape,int rotation,int x,int y,int fill[4],
@@ -371,7 +406,8 @@ static training_action generate_action(const training_action actions[MAX_ACTIONS
 }
 
 /* 环境交互：把动作真正落到棋盘上，返回这一步的奖励（放不下返回 NAN）。
-   奖励只有消行分 0/100/300/500/800，存活奖励和顶出惩罚都去掉了。 */
+   棋盘上的消行分是 0/100/300/500/800，乘 REWARD_SCALE 后奖励变成 0~8：
+   奖励和 TD 的量级都跟着缩小 100 倍，学习率才真正起作用。 */
 static double environment_step(int shape,const training_action *action,
                                int *line_score){
     int fill[4],full_rows[4],fill_line;
@@ -380,7 +416,7 @@ static double environment_step(int shape,const training_action *action,
     if(score<0)return NAN;
     clear_lines(full_rows,fill_line);
     if(line_score)*line_score=score;
-    return (double)score;
+    return (double)score*REWARD_SCALE;
 }
 
 void find_best_position(int shape,int* rotation,int* x,int* y){
@@ -506,29 +542,40 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
         double clipped_td=td_error;
         if(clipped_td>DQN_HUBER_DELTA)clipped_td=DQN_HUBER_DELTA;
         if(clipped_td<-DQN_HUBER_DELTA)clipped_td=-DQN_HUBER_DELTA;
-        double norm=1.0;
+        /* Adam 自己会按参数量纲缩放，这里不再除 1+Σφ² */
         for(int i=0;i<FEATURE_COUNT;i++)
-            norm+=transition->action.features[i]*
-                  transition->action.features[i];
-        for(int i=0;i<FEATURE_COUNT;i++)
-            gradients[i]+=clipped_td*transition->action.features[i]/norm;
-        gradient_bias+=clipped_td/norm;
+            gradients[i]+=clipped_td*transition->action.features[i];
+        gradient_bias+=clipped_td;
     }
 
+    /* 一个批次走一步 Adam：矩估计 + 偏差修正 + 逐参数自适应步长 */
+    adam_step++;
+    double correction1=1.0-pow(ADAM_BETA1,(double)adam_step);
+    double correction2=1.0-pow(ADAM_BETA2,(double)adam_step);
     double after[FEATURE_COUNT];
     for(int i=0;i<FEATURE_COUNT;i++){
-        after[i]=value_weights[i]+alpha*gradients[i]/batch_size;
+        double gradient=gradients[i]/(double)batch_size;
+        adam_m[i]=ADAM_BETA1*adam_m[i]+(1.0-ADAM_BETA1)*gradient;
+        adam_v[i]=ADAM_BETA2*adam_v[i]+(1.0-ADAM_BETA2)*gradient*gradient;
+        double m_hat=adam_m[i]/correction1;
+        double v_hat=adam_v[i]/correction2;
+        after[i]=value_weights[i]+alpha*m_hat/(sqrt(v_hat)+ADAM_EPSILON);
         if(!isfinite(after[i])){
             fprintf(stderr,"DQN 权重数值异常：feature=%d\n",i);
             return 0;
         }
     }
-    for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
-    double after_bias=value_bias+alpha*gradient_bias/batch_size;
+    double gradient_bias_average=gradient_bias/(double)batch_size;
+    adam_m_bias=ADAM_BETA1*adam_m_bias+(1.0-ADAM_BETA1)*gradient_bias_average;
+    adam_v_bias=ADAM_BETA2*adam_v_bias+(1.0-ADAM_BETA2)*gradient_bias_average*gradient_bias_average;
+    double after_bias=value_bias+alpha*(adam_m_bias/correction1)/
+        (sqrt(adam_v_bias/correction2)+ADAM_EPSILON);
     if(!isfinite(after_bias)){
         fprintf(stderr,"DQN 偏置数值异常\n");
         return 0;
     }
+
+    for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
     value_bias=after_bias;
     return 1;
 }

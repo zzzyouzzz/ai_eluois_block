@@ -26,8 +26,11 @@ static void reset_weights(void){
     }
     value_bias=0.0;
     target_bias=0.0;
+    reset_adam_state();
 }
 
+/* Adam 的第一步：m̂ = g、v̂ = g²，于是 m̂/(√v̂+ε) = sign(g)，
+   权重正好挪 ±学习率。三个用例都用学习率 0.1，所以期望值都是 0.1。 */
 static void test_terminal_target_uses_only_reward(void){
     reset_weights();
     replay_transition batch[DQN_BATCH_SIZE];
@@ -41,7 +44,7 @@ static void test_terminal_target_uses_only_reward(void){
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("terminal DQN update failed");
 
-    expect_close(value_weights[0],0.5,"terminal reward update");
+    expect_close(value_weights[0],0.1,"terminal reward update");
     expect_close(value_weights[1],0.0,"terminal target included bootstrap");
     puts("PASS: terminal DQN target");
 }
@@ -58,12 +61,12 @@ static void test_bootstrap_target_updates_current_action(void){
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("bootstrapped DQN update failed");
 
-    expect_close(value_weights[0],0.2,"reward and bootstrap update");
+    expect_close(value_weights[0],0.1,"reward and bootstrap update");
     expect_close(value_weights[1],0.0,"update changed unrelated feature");
     puts("PASS: target-network bootstrap");
 }
 
-static void test_huber_gradient_is_clipped(void){
+static void test_step_size_does_not_depend_on_td(void){
     reset_weights();
     replay_transition batch[DQN_BATCH_SIZE];
     memset(batch,0,sizeof(batch));
@@ -74,15 +77,16 @@ static void test_huber_gradient_is_clipped(void){
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("clipped DQN update failed");
 
-    /* TD=1000 若不被截断会得到 50，得到 5 说明梯度确实被截到 ±100 */
-    expect_close(value_weights[0],5.0,"Huber gradient clip");
-    puts("PASS: Huber gradient clipping");
+    /* TD=1000 若按梯度缩放会得到 100，Adam 对它做了逐参数缩放，
+       一步仍然只走学习率 0.1——这正是"特征量级差十倍也能一起学"的原因 */
+    expect_close(value_weights[0],0.1,"Adam step size is independent of TD");
+    puts("PASS: Adam step size is scale invariant");
 }
 
 int main(void){
     test_terminal_target_uses_only_reward();
     test_bootstrap_target_updates_current_action();
-    test_huber_gradient_is_clipped();
+    test_step_size_does_not_depend_on_td();
     puts("All DQN update tests passed.");
     return EXIT_SUCCESS;
 }

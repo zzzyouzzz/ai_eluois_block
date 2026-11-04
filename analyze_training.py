@@ -89,6 +89,7 @@ def load_training_trace(path, episode_offset=0):
             "features": [0.0] * 6,
             "contributions": [0.0] * 6,
             "weights": [None] * 6,
+            "bias": None,
         }
     )
     rows = 0
@@ -122,6 +123,11 @@ def load_training_trace(path, episode_offset=0):
                 terminal = int(parse_number(row, "terminal", row_number))
                 td_error = parse_number(row, "td_error", row_number)
                 board_cells = parse_number(row, "board_cells", row_number)
+                bias = (
+                    parse_number(row, "bias_after", row_number)
+                    if "bias_after" in columns
+                    else None
+                )
             except ValueError as error:
                 raise SystemExit(
                     f"CSV 第 {row_number} 行包含无效局数或步数：{error}"
@@ -140,6 +146,8 @@ def load_training_trace(path, episode_offset=0):
                 data["features"][index] += normalized
                 data["contributions"][index] += before[index] * normalized
                 data["weights"][index] = weights[index]
+            if bias is not None:
+                data["bias"] = bias
             data["td_abs_sum"] += abs(td_error)
             rows += 1
 
@@ -161,6 +169,7 @@ def load_training_trace(path, episode_offset=0):
                 value / steps for value in data["contributions"]
             ],
             "weights": data["weights"],
+            "bias": data["bias"],
         }
     return result, rows
 
@@ -216,6 +225,7 @@ def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=No
         )
         for i in range(6)
     ]
+    biases = [episodes[e]["bias"] for e in episode_ids]
 
     figure, axes = plt.subplots(4, 2, figsize=(17, 18), constrained_layout=True)
     source = (
@@ -258,6 +268,10 @@ def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=No
     axes[0, 1].set_title("探索率 epsilon")
     axes[0, 1].set_xlabel("训练局数")
     axes[0, 1].set_ylabel("epsilon")
+    axes[0, 1].ticklabel_format(axis="y", useOffset=False)
+    if epsilons and max(epsilons) - min(epsilons) < 1e-9:
+        # 固定 epsilon 时把纵轴撑开一点，否则刻度会挤成一排 0.09999…
+        axes[0, 1].set_ylim(max(0.0, epsilons[0] - 0.1), epsilons[0] + 0.1)
     axes[0, 1].grid(alpha=0.25)
 
     for index, name in enumerate(WEIGHT_NAMES):
@@ -343,10 +357,28 @@ def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=No
         ax_test.set_ylabel("测试集累计得分")
         ax_test.legend(fontsize=8)
         ax_test.grid(alpha=0.25)
+        bias_ax = axes[3, 1]
     else:
         ax_test.set_axis_off()
+        bias_ax = axes[3, 1]
 
-    axes[3, 1].set_axis_off()
+    # 偏置 b：线性模型里唯一不带特征的参数，画在最后一格
+    if any(value is not None for value in biases):
+        bias_ax.plot(
+            episode_ids,
+            biases,
+            color="#00695c",
+            linewidth=1.5,
+            label="偏置 b",
+        )
+        bias_ax.axhline(0, color="black", linewidth=0.7, alpha=0.5)
+        bias_ax.set_title("偏置 b 的变化")
+        bias_ax.set_xlabel("训练局数")
+        bias_ax.set_ylabel("b")
+        bias_ax.legend(fontsize=8)
+        bias_ax.grid(alpha=0.25)
+    else:
+        bias_ax.set_axis_off()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=160)
