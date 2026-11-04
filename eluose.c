@@ -72,9 +72,11 @@
 #ifndef DQN_LR_DECAY_STEPS
 #define DQN_LR_DECAY_STEPS 0
 #endif
-/* 是否训练偏置 b：1 = 训练，0 = 冻结在 0（用于验证"偏置漂移"的影响） */
-#ifndef DQN_TRAIN_BIAS
-#define DQN_TRAIN_BIAS 0
+/* 差分目标的基线 ρ（平均每步奖励）的学习率：
+   ρ ← ρ + DQN_RHO_RATE · 批内平均 TD。
+   ρ 复用 value_bias 这个变量存放，不再进入 Q 值本身。 */
+#ifndef DQN_RHO_RATE
+#define DQN_RHO_RATE 0.01
 #endif
 
 /* ---------- 探索（epsilon 退火） ---------- */
@@ -159,15 +161,11 @@ static double target_bias = 0.0;
    特征之间量级差十倍也不会把某个权重按死。 */
 static double adam_m[FEATURE_COUNT];
 static double adam_v[FEATURE_COUNT];
-static double adam_m_bias = 0.0;
-static double adam_v_bias = 0.0;
 static long long adam_step = 0;
 
 static void reset_adam_state(void){
     memset(adam_m,0,sizeof(adam_m));
     memset(adam_v,0,sizeof(adam_v));
-    adam_m_bias = 0.0;
-    adam_v_bias = 0.0;
     adam_step = 0;
 }
 
@@ -534,9 +532,11 @@ static int update_dqn_batch(const replay_transition *batch[DQN_BATCH_SIZE],
     }
 
     double gradients[FEATURE_COUNT]={0.0};
-    double gradient_bias=0.0;
+    double td_sum=0.0;
     for(int sample=0;sample<batch_size;sample++){
         const replay_transition *transition=batch[sample];
+        /* 差分目标：V(s) = w·φ(s)，ρ 放在 value_bias 里，
+           td = (r − ρ) + γ·V(s') − V(s)，平均 TD 用来更新 ρ */
         double current_value=score_features(value_weights,value_bias,
                                             transition->action.feature);
         double next_value=0.0;
@@ -546,9 +546,9 @@ static int update_dqn_batch(const replay_transition *batch[DQN_BATCH_SIZE],
                                                    target_weights,target_bias);
         if(next_best.r>=0&&!next_best.top_out)next_value=next_best.value;
     }
-        double target=transition->reward+
-            (transition->next_count>0?gamma*next_value:0.0);
-        double td_error=target-current_value;
+        double target=transition->reward+gamma*next_value;
+        double td_error=target-current_value;//td_error=reward+gamma*(next_best.value+target_bias)-(current_value+value_bias)没有任何问题
+        td_sum+=td_error;
         if(!isfinite(current_value)||!isfinite(next_value)||
            !isfinite(target)||!isfinite(td_error)){
             fprintf(stderr,"DQN 训练数值异常\n");
@@ -558,7 +558,6 @@ static int update_dqn_batch(const replay_transition *batch[DQN_BATCH_SIZE],
         /* Adam 自己会按参数量纲缩放，这里不再除 1+Σφ² */
         for(int i=0;i<FEATURE_COUNT;i++)
             gradients[i]+=td_error*transition->action.feature[i];
-        gradient_bias+=td_error;
     }
 
     /* 一个批次走一步 Adam：矩估计 + 偏差修正 + 逐参数自适应步长 */
@@ -582,21 +581,15 @@ static int update_dqn_batch(const replay_transition *batch[DQN_BATCH_SIZE],
             return 0;
         }
     }
-    double gradient_bias_average=gradient_bias/(double)batch_size;
-    adam_m_bias=ADAM_BETA1*adam_m_bias+(1.0-ADAM_BETA1)*gradient_bias_average;
-    adam_v_bias=ADAM_BETA2*adam_v_bias+(1.0-ADAM_BETA2)*gradient_bias_average*gradient_bias_average;
-    double after_bias=value_bias+step_alpha*(adam_m_bias/correction1)/
-        (sqrt(adam_v_bias/correction2)+ADAM_EPSILON);
-#if DQN_TRAIN_BIAS == 0
-    after_bias=value_bias;
-#endif
-    if(!isfinite(after_bias)){
-        fprintf(stderr,"DQN 偏置数值异常\n");
+    /* ρ 按平均 TD 做一步 Robbins-Monro：td>0 说明 ρ 偏小，往上抬 */
+    double rho_step=DQN_RHO_RATE*td_sum/(double)batch_size;
+    if(!isfinite(rho_step)){
+        fprintf(stderr,"DQN 基线数值异常\n");
         return 0;
     }
+    value_bias+=rho_step;
 
     for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
-    value_bias=after_bias;
     return 1;
 }
 
@@ -682,7 +675,7 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
        训练奖励已经乘过 REWARD_SCALE，除回去就是它 */
     int score=(int)(transition->reward/REWARD_SCALE+0.5);
 
-    /* 候选动作是挑动作前刚算的，与更新用的是同一版权重 */
+    /* 与 update_dqn_batch 同一套差分口径：V = w·φ，ρ = value_bias */
     double current_value=action->value;
     double next_value=0.0;
     if(transition->next_count>0){
