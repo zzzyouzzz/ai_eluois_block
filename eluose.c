@@ -306,11 +306,17 @@ void evaluate_board(int* drow,int* dcol,int* holes,int* well){//评估棋盘
         }
     }
 }
+/* 一个候选：局面编码 + 落法 + 价值。
+   价值不提前算，generate_action 里按当时的权重现算。 */
 typedef struct{
-    int valid,rotation,x,y,top_out;
-    double features[FEATURE_COUNT];
+    double feature[FEATURE_COUNT];
+    int shape;
+    int r;                      /* 旋转 */
+    int x;
+    int y;
+    int top_out;
     double value;
-}training_action;
+}state_and_action;
 
 static double score_features(const double weights[FEATURE_COUNT],double bias,
                              const double features[FEATURE_COUNT]){
@@ -365,40 +371,22 @@ int get_block(FILE *fp){
 }
 #define MAX_ACTIONS 40
 
-/* 枚举 shape 的所有落点，填满 actions[]，返回动作个数。
-   shape 不是合法方块（EOF / -1 / 7）时返回 0，并把 40 个动作全部置零。 */
-static int evaluate_action(int shape,const double weights[FEATURE_COUNT],
-                           double bias,training_action actions[MAX_ACTIONS]){
-    memset(actions,0,sizeof(training_action)*MAX_ACTIONS);
-    if(shape<0||shape>=7)return 0;
-    int count=0;
-    for(int rotation=0;rotation<block_r[shape];rotation++){
-        for(int x=0;x<10;x++){
-            if(!can_place(shape,rotation,x,16))continue;
-            int y=simulate_fall(shape,rotation,x);
-            if(y<0||y>=20)continue;
-            training_action *action=&actions[count];
-            if(!extract_action_features(shape,rotation,x,y,
-                                        block_h[shape][rotation],
-                                        action->features))
-                continue;
-            action->valid=1;
-            action->rotation=rotation;
-            action->x=x;
-            action->y=y;
-            action->top_out=y+block_h[shape][rotation]>14;
-            action->value=score_features(weights,bias,action->features);
-            count++;
-        }
-    }
-    return count;
-}
+/* 从候选里挑一个动作。它只做两件事：
+   1) 用 score_features 把每个候选的 value 现算出来；
+   2) 以 epsilon 概率随机，否则在非顶出的候选里取 value 最大。
+   候选（feature/r/x/y/top_out）由 environment_step 负责填好，这里不生成。
+   返回选中的那一个（拷贝）；没有候选时返回 r=-1 的无效动作。 */
+static state_and_action generate_action(state_and_action actions[MAX_ACTIONS],
+                                        int count,double epsilon,
+                                        const double weights[FEATURE_COUNT],
+                                        double bias){
+    state_and_action invalid={0};
+    invalid.r=-1;
+    if(count<=0||count>MAX_ACTIONS)return invalid;
 
-/* 从候选里挑一个：按 epsilon 随机；否则在非顶出的动作里取 Q 最大 */
-static training_action generate_action(const training_action actions[MAX_ACTIONS],
-                                       int count,double epsilon){
-    training_action invalid={0};
-    if(count<=0)return invalid;
+    for(int i=0;i<count;i++)
+        actions[i].value=score_features(weights,bias,actions[i].feature);
+
     int selected=-1;
     if((double)rand()/((double)RAND_MAX+1.0)<epsilon){
         selected=rand()%count;
@@ -413,35 +401,49 @@ static training_action generate_action(const training_action actions[MAX_ACTIONS
     return actions[selected];
 }
 
-/* 环境交互：把动作真正落到棋盘上，返回这一步的奖励（放不下返回 NAN）。
-   棋盘上的消行分是 0/100/300/500/800，乘 REWARD_SCALE 后奖励变成 0~8：
-   奖励和 TD 的量级都跟着缩小 100 倍，学习率才真正起作用。 */
-static double environment_step(int shape,const training_action *action,
-                               int *line_score){
-    int fill[4],full_rows[4],fill_line;
-    int score=place_block(shape,action->rotation,action->x,action->y,
-                          fill,full_rows,&fill_line);
-    if(score<0)return NAN;
-    clear_lines(full_rows,fill_line);
-    if(line_score)*line_score=score;
-    return (double)score*REWARD_SCALE;
-}
 
-void find_best_position(int shape,int* rotation,int* x,int* y){
-    training_action actions[MAX_ACTIONS];
-    int count=evaluate_action(shape,value_weights,value_bias,actions);
-    training_action action=generate_action(actions,count,0.0);
-    if(!action.valid){
-        *rotation=0;
-        *x=0;
-        *y=-1;
-        return;
+/* 环境交互。
+   action==NULL：不落子，只读入第一个方块，把它的候选写进 next[]；
+   否则：落子、消行、读入下一个方块，把新候选直接覆盖到 next[]
+         （调用方手里的 action 是副本，所以可以安全覆盖）。
+   返回新候选个数（0 表示这一局结束），*reward 是这一步的奖励。
+   方块流由参数 input 传进来，get_block 只在这里调用。 */
+static int environment_step(const state_and_action *action,FILE *input,
+                            state_and_action next[MAX_ACTIONS],double *reward){
+    if(reward)*reward=0.0;
+    if(action){
+        int fill[4],full_rows[4],fill_line;
+        int score=place_block(action->shape,action->r,action->x,action->y,
+                              fill,full_rows,&fill_line);
+        if(score<0)return -1;
+        clear_lines(full_rows,fill_line);
+        if(reward)*reward=(double)score*REWARD_SCALE;
     }
-    *rotation=action.rotation;
-    *x=action.x;
-    *y=action.y;
+    /* 枚举下一个方块的全部落点，直接写进 next[]：只填 feature 与落法，不算价值 */
+    int shape=get_block(input);
+    memset(next,0,sizeof(state_and_action)*MAX_ACTIONS);
+    if(shape<0||shape>=7)return 0;
+    int count=0;
+    for(int rotation=0;rotation<block_r[shape];rotation++){
+        for(int x=0;x<10;x++){
+            if(!can_place(shape,rotation,x,16))continue;
+            int y=simulate_fall(shape,rotation,x);
+            if(y<0||y>=20)continue;
+            state_and_action *candidate=&next[count];
+            if(!extract_action_features(shape,rotation,x,y,
+                                        block_h[shape][rotation],
+                                        candidate->feature))
+                continue;
+            candidate->shape=shape;
+            candidate->r=rotation;
+            candidate->x=x;
+            candidate->y=y;
+            candidate->top_out=y+block_h[shape][rotation]>14;
+            count++;
+        }
+    }
+    return count;
 }
-
 static int load_value_model(const char *path){
     FILE *fp=fopen(path,"r");
     if(!fp){
@@ -505,11 +507,12 @@ static int save_value_model(const char *path){
 /* 训练超参已统一移到文件开头的「参数配置区」 */
 
 typedef struct{
-    training_action action;
-    double next_features[FEATURE_COUNT];
+    state_and_action action;                 /* 这一步选中的落法 */
+    int next_count;                          /* 下一状态的候选数，0 = 终局 */
+    state_and_action next[MAX_ACTIONS];
     double reward;
-    int terminal;
 }replay_transition;
+
 
 static replay_transition replay_buffer[DQN_REPLAY_CAPACITY];
 static int replay_size;
@@ -522,7 +525,8 @@ static int random_below(int upper_bound){
     return (int)(random_value%(unsigned int)upper_bound);
 }
 
-static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
+/* batch 里只放指针，直接指向回放槽位——不再把 3.2 KB 的记录一条条拷进来 */
+static int update_dqn_batch(const replay_transition *batch[DQN_BATCH_SIZE],
                             int batch_size,double alpha,double gamma){
     if(batch_size<1||batch_size>DQN_BATCH_SIZE){
         fprintf(stderr,"DQN 批次大小无效\n");
@@ -532,14 +536,18 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
     double gradients[FEATURE_COUNT]={0.0};
     double gradient_bias=0.0;
     for(int sample=0;sample<batch_size;sample++){
-        const replay_transition *transition=&batch[sample];
+        const replay_transition *transition=batch[sample];
         double current_value=score_features(value_weights,value_bias,
-                                            transition->action.features);
-        double next_value=transition->terminal?0.0:
-            score_features(target_weights,target_bias,
-                           transition->next_features);
+                                            transition->action.feature);
+        double next_value=0.0;
+    if(transition->next_count>0){
+        state_and_action next_best=generate_action((state_and_action *)transition->next,
+                                                   transition->next_count,0.0,
+                                                   target_weights,target_bias);
+        if(next_best.r>=0&&!next_best.top_out)next_value=next_best.value;
+    }
         double target=transition->reward+
-            (transition->terminal?0.0:gamma*next_value);
+            (transition->next_count>0?gamma*next_value:0.0);
         double td_error=target-current_value;
         if(!isfinite(current_value)||!isfinite(next_value)||
            !isfinite(target)||!isfinite(td_error)){
@@ -549,7 +557,7 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
 
         /* Adam 自己会按参数量纲缩放，这里不再除 1+Σφ² */
         for(int i=0;i<FEATURE_COUNT;i++)
-            gradients[i]+=td_error*transition->action.features[i];
+            gradients[i]+=td_error*transition->action.feature[i];
         gradient_bias+=td_error;
     }
 
@@ -592,11 +600,15 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
     return 1;
 }
 
-static void add_replay_transition(const replay_transition *transition){
-    replay_buffer[replay_next]=*transition;
+/* 占一个回放槽位：返回可写的指针，游标与计数一起推进。
+   调用方直接把这一条转移写进槽里，省掉一次整块拷贝。 */
+static replay_transition *replay_reserve(void){
+    replay_transition *slot=&replay_buffer[replay_next];
     replay_next=(replay_next+1)%DQN_REPLAY_CAPACITY;
     if(replay_size<DQN_REPLAY_CAPACITY)replay_size++;
+    return slot;
 }
+
 
 /* ==================================================================
    数据追踪模块：与训练逻辑解耦，只读训练状态、只写训练 CSV
@@ -643,7 +655,7 @@ typedef struct{
     int episode;
     unsigned long long turn;
     int shape;
-    training_action action;
+    state_and_action action;
     double epsilon;
     int score;
     double reward;
@@ -661,21 +673,30 @@ typedef struct{
 static trace_step_state trace_step;
 
 static int trace_begin_step(int episode,unsigned long long turn,int shape,
-                            const training_action *action,double epsilon,int score,
+                            const state_and_action *action,double epsilon,
                             const replay_transition *transition){
     trace_step.active=0;
     if(!trace_training_file)return 1;
 
+    /* 这里要的是棋盘上的原始消行分（0/100/300/500/800），
+       训练奖励已经乘过 REWARD_SCALE，除回去就是它 */
+    int score=(int)(transition->reward/REWARD_SCALE+0.5);
+
     /* 候选动作是挑动作前刚算的，与更新用的是同一版权重 */
     double current_value=action->value;
-    double next_value=transition->terminal?0.0:
-        score_features(target_weights,target_bias,transition->next_features);
+    double next_value=0.0;
+    if(transition->next_count>0){
+        state_and_action next_best=generate_action((state_and_action *)transition->next,
+                                                   transition->next_count,0.0,
+                                                   target_weights,target_bias);
+        if(next_best.r>=0&&!next_best.top_out)next_value=next_best.value;
+    }
     double target=transition->reward+
-        (transition->terminal?0.0:DQN_GAMMA*next_value);
+        (transition->next_count>0?DQN_GAMMA*next_value:0.0);
     double td_error=target-current_value;
     double norm=1.0;
     for(int i=0;i<FEATURE_COUNT;i++)
-        norm+=action->features[i]*action->features[i];
+        norm+=action->feature[i]*action->feature[i];
     if(!isfinite(current_value)||!isfinite(next_value)||
        !isfinite(target)||!isfinite(td_error)||!isfinite(norm)){
         fprintf(stderr,"训练数值异常：episode=%d turn=%llu\n",episode,turn);
@@ -690,7 +711,7 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
     trace_step.epsilon=epsilon;
     trace_step.score=score;
     trace_step.reward=transition->reward;
-    trace_step.terminal=transition->terminal;
+    trace_step.terminal=transition->next_count<=0;
     trace_step.current_value=current_value;
     trace_step.next_value=next_value;
     trace_step.target=target;
@@ -709,7 +730,7 @@ static int trace_end_step(void){
                "%d,%llu,%d,%d,%d,%d,%.17g,%d,%.17g,%d,"
                "%.17g,%.17g,%.17g,%.17g,%.17g,%d",
                trace_step.episode,trace_step.turn,trace_step.shape,
-               trace_step.action.rotation,trace_step.action.x,
+               trace_step.action.r,trace_step.action.x,
                trace_step.action.y,trace_step.epsilon,trace_step.score,
                trace_step.reward,trace_step.terminal,trace_step.current_value,
                trace_step.next_value,trace_step.target,trace_step.td_error,
@@ -720,8 +741,8 @@ static int trace_end_step(void){
     for(int i=0;i<FEATURE_COUNT;i++){
         double delta=value_weights[i]-trace_step.before[i];
         if(fprintf(trace_training_file,",%.17g,%.17g,%.17g,%.17g,%.17g",
-                   trace_step.action.features[i],trace_step.before[i],
-                   trace_step.before[i]*trace_step.action.features[i],
+                   trace_step.action.feature[i],trace_step.before[i],
+                   trace_step.before[i]*trace_step.action.feature[i],
                    delta,value_weights[i])<0){
             fprintf(stderr,"写入训练追踪文件失败\n");
             return 0;
@@ -741,12 +762,13 @@ static int trace_end_step(void){
 
 /* ------------------------ 数据追踪模块结束 ------------------------ */
 
-static int train_on_transition(const replay_transition *transition){
-    add_replay_transition(transition);
+/* 这一条转移已经躺在回放区里（train_value_episode 用 replay_reserve 拿的槽），
+   这里只负责抽样更新与目标网络同步 */
+static int train_on_transition(void){
     if(replay_size>=DQN_REPLAY_WARMUP){
-        replay_transition batch[DQN_BATCH_SIZE];
+        const replay_transition *batch[DQN_BATCH_SIZE];
         for(int i=0;i<DQN_BATCH_SIZE;i++)
-            batch[i]=replay_buffer[random_below(replay_size)];
+            batch[i]=&replay_buffer[random_below(replay_size)];
         if(!update_dqn_batch(batch,DQN_BATCH_SIZE,DQN_LEARNING_RATE,
                              DQN_GAMMA))
             return 0;
@@ -764,69 +786,49 @@ static int train_value_episode(FILE *block_input,int episode,
     memset(board,0,sizeof(board));
     *has_training_data=0;
 
-    int shape=get_block(block_input);
-    training_action actions[MAX_ACTIONS];
-    training_action next_actions[MAX_ACTIONS];
+    /* 环境先吐出第一个方块的候选：还没有落子，所以没有奖励 */
+    state_and_action first_candidates[MAX_ACTIONS];
+    state_and_action *candidates=first_candidates;
+    double reward=0.0;
+    int count=environment_step(NULL,block_input,candidates,&reward);
+    if(count<=0)return 1;               /* 输入为空：这一局没有可训练的数据 */
 
     for(unsigned long long turn=1;;turn++){
-        /* 每次挑动作前都按当前权重重算候选，避免用到上一次更新之前的旧 Q */
-        int count=evaluate_action(shape,value_weights,value_bias,actions);
-        training_action action=generate_action(actions,count,epsilon);
-        if(!action.valid){
+        /* 到这里才真正算 Q，并把选中的落法复制出来 */
+        state_and_action action=generate_action(candidates,count,epsilon,
+                                                value_weights,value_bias);
+        if(action.r<0){
             fprintf(stderr,"无法生成训练动作：episode=%d turn=%llu\n",
                     episode,turn);
             return 0;
         }
+        int shape=action.shape;
 
-        int line_score=0;
-        double reward=environment_step(shape,&action,&line_score);
-        if(!isfinite(reward)){
+        /* 先占一个回放槽，再让环境把下一个方块的候选直接写进槽里的 next[]：
+           全程没有“候选数组 → transition → 回放”的整块拷贝 */
+        replay_transition *transition=replay_reserve();
+        transition->action=action;
+        transition->reward=reward;
+        count=environment_step(&action,block_input,transition->next,&reward);
+        if(count<0){
             fprintf(stderr,"训练动作无法放置：episode=%d turn=%llu\n",
                     episode,turn);
             return 0;
         }
+        transition->reward=reward;
+        if(action.top_out)count=0;      /* 这一步会顶出：按终局处理 */
+        transition->next_count=count;
+        candidates=transition->next;    /* 下一轮直接在这份候选上挑 */
 
-        int terminal=action.top_out;
-        int next_shape=-1;
-        replay_transition transition={0};
-        transition.action=action;
-        transition.reward=reward;
-        if(!terminal){
-            next_shape=get_block(block_input);
-            terminal=next_shape<0||next_shape==7;
-            if(!terminal){
-                /* bootstrap 用的是贝尔曼目标里的那一网络：候选按目标模型打分，
-                   选出来的 next_action 只用来取特征，不参与下一轮的动作生成
-                   （下一轮会按最新权重重新 evaluate）。 */
-                int next_count=evaluate_action(next_shape,target_weights,
-                                               target_bias,next_actions);
-                training_action next_action=
-                    generate_action(next_actions,next_count,0.0);
-                if(!next_action.valid){
-                    fprintf(stderr,
-                            "无法生成后继动作：episode=%d turn=%llu\n",
-                            episode,turn);
-                    return 0;
-                }
-                memcpy(transition.next_features,next_action.features,
-                       sizeof(transition.next_features));
-            }
-        }
-        transition.terminal=terminal;
-
-        trace_begin_step(episode,turn,shape,&action,epsilon,line_score,
-                         &transition);
-        if(!train_on_transition(&transition))
+        trace_begin_step(episode,turn,shape,&action,epsilon,transition);
+        if(!train_on_transition())
             return 0;
         trace_end_step();
         *has_training_data=1;
-        if(terminal)break;
-
-        shape=next_shape;
+        if(count==0)break;              /* 候选为空 = 这一局结束 */
     }
     return 1;
 }
-
 static int train_value_model(int episodes,const char *input_path,
                              int *completed_episodes){
     srand((unsigned int)time(NULL));
@@ -870,26 +872,20 @@ static int train_value_model(int episodes,const char *input_path,
 static int run_game(FILE *input){
     clock_t start=clock();
     int score=0;
-    int current_block=get_block(input);
-    int next_block=get_block(input);
 
-    while(current_block>=0&&current_block<7){
-        int rotation=0,x=0,y=16;
-        find_best_position(current_block,&rotation,&x,&y);
-        int fill[4],full_rows[4],fill_line;
-        int block_score=place_block(current_block,rotation,x,y,
-                                    fill,full_rows,&fill_line);
-        if(block_score<0){
-            fprintf(stderr,"无法放置方块\n");
-            return 1;
+    state_and_action candidates[MAX_ACTIONS];
+    double reward=0.0;
+    int count=environment_step(NULL,input,candidates,&reward);
+
+    while(count>0){
+        int best=-1;
+        for(int i=0;i<count;i++){
+            if(candidates[i].top_out)continue;
+            candidates[i].value=score_features(value_weights,value_bias,
+                                               candidates[i].feature);
+            if(best<0||candidates[i].value>candidates[best].value)best=i;
         }
-        score+=block_score;
-        clear_lines(full_rows,fill_line);
-
-        printf("%d %d\n%d\n",rotation,x,score);
-        fflush(stdout);
-
-        if(y+block_h[current_block][rotation]>14){
+        if(best<0){                      /* 没有安全落点：顶出 */
             printf("You lose!\n");
             for(int row=19;row>=0;row--){
                 for(int column=0;column<10;column++)
@@ -899,14 +895,29 @@ static int run_game(FILE *input){
             break;
         }
 
-        if(next_block==-1||next_block==7||next_block==-666)break;
-        current_block=next_block;
-        next_block=get_block(input);
+        state_and_action action=candidates[best];
+        count=environment_step(&action,input,candidates,&reward);
+        if(count<0){
+            fprintf(stderr,"无法放置方块\n");
+            return 1;
+        }
+        score+=(int)(reward/REWARD_SCALE+0.5);
+        printf("%d %d\n%d\n",action.r,action.x,score);
+        fflush(stdout);
+
+        if(action.top_out||count==0){
+            printf("You lose!\n");
+            for(int row=19;row>=0;row--){
+                for(int column=0;column<10;column++)
+                    printf("%c"," O"[board[row][column]]);
+                printf("\n");
+            }
+            break;
+        }
     }
     printf("耗时：%d ms\n",clock()-start);
     return 0;
 }
-
 int main(int argc,char **argv){
     int training=0;
     const int fresh_model=TRAIN_FRESH;

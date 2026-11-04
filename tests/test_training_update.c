@@ -33,12 +33,13 @@ static void reset_weights(void){
    权重正好挪 ±学习率。三个用例都用学习率 0.1，所以期望值都是 0.1。 */
 static void test_terminal_target_uses_only_reward(void){
     reset_weights();
-    replay_transition batch[DQN_BATCH_SIZE];
-    memset(batch,0,sizeof(batch));
-    batch[0].action.features[0]=1.0;
-    batch[0].reward=10.0;
-    batch[0].terminal=1;
-    batch[0].next_features[1]=100.0;   /* 终局时应该被忽略 */
+    replay_transition samples[DQN_BATCH_SIZE];
+    const replay_transition *batch[DQN_BATCH_SIZE]={&samples[0]};
+    memset(samples,0,sizeof(samples));
+    samples[0].action.feature[0]=1.0;
+    samples[0].reward=10.0;
+    samples[0].next_count=0;             /* 终局：没有候选 */
+    samples[0].next[0].feature[1]=100.0; /* 终局时应该被忽略 */
     target_weights[1]=100.0;
 
     if(!update_dqn_batch(batch,1,0.1,0.5))
@@ -51,12 +52,14 @@ static void test_terminal_target_uses_only_reward(void){
 
 static void test_bootstrap_target_updates_current_action(void){
     reset_weights();
-    replay_transition batch[DQN_BATCH_SIZE];
-    memset(batch,0,sizeof(batch));
-    batch[0].action.features[0]=2.0;
-    batch[0].next_features[1]=1.0;
+    replay_transition samples[DQN_BATCH_SIZE];
+    const replay_transition *batch[DQN_BATCH_SIZE]={&samples[0]};
+    memset(samples,0,sizeof(samples));
+    samples[0].action.feature[0]=2.0;
+    samples[0].next_count=1;
+    samples[0].next[0].feature[1]=1.0;
     target_weights[1]=4.0;
-    batch[0].reward=3.0;
+    samples[0].reward=3.0;
 
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("bootstrapped DQN update failed");
@@ -68,11 +71,12 @@ static void test_bootstrap_target_updates_current_action(void){
 
 static void test_step_size_does_not_depend_on_td(void){
     reset_weights();
-    replay_transition batch[DQN_BATCH_SIZE];
-    memset(batch,0,sizeof(batch));
-    batch[0].action.features[0]=1.0;
-    batch[0].reward=1000.0;
-    batch[0].terminal=1;
+    replay_transition samples[DQN_BATCH_SIZE];
+    const replay_transition *batch[DQN_BATCH_SIZE]={&samples[0]};
+    memset(samples,0,sizeof(samples));
+    samples[0].action.feature[0]=1.0;
+    samples[0].reward=1000.0;
+    samples[0].next_count=0;
 
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("clipped DQN update failed");
