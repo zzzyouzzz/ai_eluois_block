@@ -44,19 +44,17 @@
 /* 回放区攒满多少条才开始更新 */
 #define DQN_REPLAY_WARMUP 64
 /* 每多少次批量更新同步一次目标网络 */
-#define DQN_TARGET_UPDATE_INTERVAL 500
-/* 梯度裁剪阈值：|TD| 超过它就按 ±100 截断（防止个别样本把权重带飞） */
-#define DQN_HUBER_DELTA 100.0
+#define DQN_TARGET_UPDATE_INTERVAL 10
 /* 折扣因子 */
 #define DQN_GAMMA 0.99
 /* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
 #ifndef DQN_LEARNING_RATE
-#define DQN_LEARNING_RATE 0.005
+#define DQN_LEARNING_RATE 0.0004
 #endif
 /* 奖励缩放：棋盘上的消行分 0/100/300/500/800 乘这个系数才是训练奖励，
    0.01 即奖励变成 0~8，TD 和梯度的量级同步缩小 100 倍。 */
 #ifndef REWARD_SCALE
-#define REWARD_SCALE 0.01
+#define REWARD_SCALE 1
 #endif
 /* Adam 的超参 */
 #ifndef ADAM_BETA1
@@ -68,6 +66,16 @@
 #ifndef ADAM_EPSILON
 #define ADAM_EPSILON 1e-8
 #endif
+/* 学习率衰减：Adam 的步长不会自己变小，走够几十万步权重就会一路漂移。
+   0 = 不衰减（之前的行为）；N = 每走 N 步学习率减半，
+   即 alpha_t = alpha / (1 + step/N)。 */
+#ifndef DQN_LR_DECAY_STEPS
+#define DQN_LR_DECAY_STEPS 0
+#endif
+/* 是否训练偏置 b：1 = 训练，0 = 冻结在 0（用于验证"偏置漂移"的影响） */
+#ifndef DQN_TRAIN_BIAS
+#define DQN_TRAIN_BIAS 0
+#endif
 
 /* ---------- 探索（epsilon 退火） ---------- */
 
@@ -77,10 +85,10 @@
    整体平滑下降，而不是每批都重新从高处探索一遍。
    两个值设成一样就是固定 epsilon（现在的默认值），便于做可复现实验。 */
 #ifndef TRAIN_EPSILON_START
-#define TRAIN_EPSILON_START 0.1
+#define TRAIN_EPSILON_START 0.05
 #endif
 #ifndef TRAIN_EPSILON_END
-#define TRAIN_EPSILON_END 0.1
+#define TRAIN_EPSILON_END 0.05
 #endif
 
 const int block[7][4][4][2] = {
@@ -539,17 +547,18 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
             return 0;
         }
 
-        double clipped_td=td_error;
-        if(clipped_td>DQN_HUBER_DELTA)clipped_td=DQN_HUBER_DELTA;
-        if(clipped_td<-DQN_HUBER_DELTA)clipped_td=-DQN_HUBER_DELTA;
         /* Adam 自己会按参数量纲缩放，这里不再除 1+Σφ² */
         for(int i=0;i<FEATURE_COUNT;i++)
-            gradients[i]+=clipped_td*transition->action.features[i];
-        gradient_bias+=clipped_td;
+            gradients[i]+=td_error*transition->action.features[i];
+        gradient_bias+=td_error;
     }
 
     /* 一个批次走一步 Adam：矩估计 + 偏差修正 + 逐参数自适应步长 */
     adam_step++;
+    double step_alpha=alpha;
+#if DQN_LR_DECAY_STEPS > 0
+    step_alpha=alpha/(1.0+(double)adam_step/(double)DQN_LR_DECAY_STEPS);
+#endif
     double correction1=1.0-pow(ADAM_BETA1,(double)adam_step);
     double correction2=1.0-pow(ADAM_BETA2,(double)adam_step);
     double after[FEATURE_COUNT];
@@ -559,7 +568,7 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
         adam_v[i]=ADAM_BETA2*adam_v[i]+(1.0-ADAM_BETA2)*gradient*gradient;
         double m_hat=adam_m[i]/correction1;
         double v_hat=adam_v[i]/correction2;
-        after[i]=value_weights[i]+alpha*m_hat/(sqrt(v_hat)+ADAM_EPSILON);
+        after[i]=value_weights[i]+step_alpha*m_hat/(sqrt(v_hat)+ADAM_EPSILON);
         if(!isfinite(after[i])){
             fprintf(stderr,"DQN 权重数值异常：feature=%d\n",i);
             return 0;
@@ -568,8 +577,11 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
     double gradient_bias_average=gradient_bias/(double)batch_size;
     adam_m_bias=ADAM_BETA1*adam_m_bias+(1.0-ADAM_BETA1)*gradient_bias_average;
     adam_v_bias=ADAM_BETA2*adam_v_bias+(1.0-ADAM_BETA2)*gradient_bias_average*gradient_bias_average;
-    double after_bias=value_bias+alpha*(adam_m_bias/correction1)/
+    double after_bias=value_bias+step_alpha*(adam_m_bias/correction1)/
         (sqrt(adam_v_bias/correction2)+ADAM_EPSILON);
+#if DQN_TRAIN_BIAS == 0
+    after_bias=value_bias;
+#endif
     if(!isfinite(after_bias)){
         fprintf(stderr,"DQN 偏置数值异常\n");
         return 0;
