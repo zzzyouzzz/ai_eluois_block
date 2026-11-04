@@ -51,7 +51,7 @@ $EpisodesPerBatch = 200
 $BatchCount = 20
 
 # epsilon 退火：整体从 $EpsilonStart 平滑降到 $EpsilonEnd，跨 $BatchCount 批分摊
-$EpsilonStart = 0.35
+$EpsilonStart = 0.05
 $EpsilonEnd   = 0.05
 
 # 工作目录：exe、模型、CSV 都放这里

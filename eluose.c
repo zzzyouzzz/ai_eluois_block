@@ -22,8 +22,7 @@
 #define TRAIN_EPISODES 2000
 #endif
 /* 是否忽略已保存的模型、从源码里的初始值开始训练：1 = 忽略，0 = 沿用
-   模型文件。注意初始参数（含 w1/w2）写在 q_weights.dat 里，选 1 时那份
-   文件不会被读取，隐藏层从 0 开始（等价纯线性）。 */
+   模型文件。初始值就是上面 value_weights 的 6 个数，选 1 时不读文件。 */
 #ifndef TRAIN_FRESH
 #define TRAIN_FRESH 0
 #endif
@@ -48,9 +47,6 @@
 #define DQN_TARGET_UPDATE_INTERVAL 500
 /* 梯度裁剪阈值：|TD| 超过它就按 ±100 截断（防止个别样本把权重带飞） */
 #define DQN_HUBER_DELTA 100.0
-/* 顶出惩罚：reward -= 300·exp(-(步数-1)/60)，越早顶出扣得越狠 */
-#define DQN_EARLY_END_PENALTY 300.0
-#define DQN_EARLY_END_DECAY 60.0
 /* 折扣因子 */
 #define DQN_GAMMA 0.99
 /* 学习率 */
@@ -61,12 +57,13 @@
 /* 每局训练用的 epsilon 从 START 线性降到 END，END 同时是下限。
    第 0 局用 START，最后一局正好落在 END 上。run_experiments.ps1 把
    上一批的 END 当成下一批的 START 传进来，于是 epsilon 跨批首尾相接、
-   整体平滑下降，而不是每批都重新从高处探索一遍。 */
+   整体平滑下降，而不是每批都重新从高处探索一遍。
+   两个值设成一样就是固定 epsilon（现在的默认值），便于做可复现实验。 */
 #ifndef TRAIN_EPSILON_START
-#define TRAIN_EPSILON_START 0.35
+#define TRAIN_EPSILON_START 0.1
 #endif
 #ifndef TRAIN_EPSILON_END
-#define TRAIN_EPSILON_END 0.05
+#define TRAIN_EPSILON_END 0.1
 #endif
 
 const int block[7][4][4][2] = {
@@ -125,25 +122,13 @@ const int block[7][4][4][2] = {
 int board[25][15]={0};
 enum { FEATURE_COUNT = 6 };
 double value_weights[FEATURE_COUNT] = {-45.0, 34.0, -32.0, -93.0, -79.0, -34.0};
+/* 常数偏置：Q = w·φ + b。没有它，整体几百上千的偏移只能靠特征硬凑。 */
+double value_bias = 0.0;
 
-/* ---- 价值模型：线性主干 + 一层 tanh 隐藏层（残差连接） ----
-   Q = w·φ + Σ_h w2[h]·tanh( b1[h] + Σ_j w1[h][j]·φ_j·HIDDEN_INPUT_SCALE[j] )
-   w2 初始为 0 时隐藏层贡献恒为 0，网络严格退化为原来的线性模型。 */
-enum { HIDDEN_SIZE = 16 };
-typedef struct{
-    double w1[HIDDEN_SIZE][FEATURE_COUNT];
-    double b1[HIDDEN_SIZE];
-    double w2[HIDDEN_SIZE];
-}hidden_layer;
-static hidden_layer hidden;
-static hidden_layer target_hidden;
+/* 价值模型：6 个权重 + 1 个偏置（目标网络各一份） */
 static double target_weights[FEATURE_COUNT];
+static double target_bias = 0.0;
 
-/* 隐藏层输入端缩放：6 维特征量级差得很大（高度 0..20，井深可到上百），
-   不压到 O(1) 附近的话 tanh 一开始就饱和、梯度消失。 */
-static const double HIDDEN_INPUT_SCALE[FEATURE_COUNT]={
-    1.0/20.0,1.0/16.0,1.0/50.0,1.0/50.0,1.0/50.0,1.0/50.0
-};
 int block_r[7]={2,4,1,4,4,2,2};//每个方块的旋转数
 int block_w[7][4]={
     {3,0,3,0},
@@ -165,58 +150,11 @@ int block_h[7][4]={
 };
 int can_place(int shape,int rotation,int x,int y);
 
-/* 隐藏层的初始参数：手写的 16 个偏置 + 16×6 权重 + 16 个输出权重，
-   与仓库里 q_weights.dat 的 128 个数逐位相同。写死在源码里，是为了让
-   "没有模型文件"也能从有意义的初值起步，而不是隐藏层全 0。
-   每个隐单元主盯一个特征（0.30 / 0.24 / 0.18 三档），再对另一个特征取 -0.10。
-   想改初值：改这里，或者改 q_weights.dat（文件存在时以文件为准）。 */
-static const double INITIAL_B1[HIDDEN_SIZE]={
-    0.0, 0.1, -0.1, 0.05, -0.05, 0.1, -0.1, 0.05,
-    -0.05, 0.1, -0.1, 0.05, -0.05, 0.1, -0.1, 0.05
-};
-static const double INITIAL_W1[HIDDEN_SIZE][FEATURE_COUNT]={
-    /*            高度   消行   行变化  列变化  洞数   井深 */
-    { 0.30, -0.10,  0.00,  0.00,  0.00,  0.00},   /*  0 高度 */
-    { 0.00,  0.30,  0.00,  0.00, -0.10,  0.00},   /*  1 消行 */
-    { 0.00, -0.10,  0.30,  0.00,  0.00,  0.00},   /*  2 行变化 */
-    { 0.00,  0.00,  0.00,  0.30, -0.10,  0.00},   /*  3 列变化 */
-    { 0.00, -0.10,  0.00,  0.00,  0.30,  0.00},   /*  4 洞数 */
-    { 0.00,  0.00,  0.00,  0.00, -0.10,  0.30},   /*  5 井深 */
-    { 0.24, -0.10,  0.00,  0.00,  0.00,  0.00},   /*  6 高度（弱） */
-    { 0.00,  0.24,  0.00,  0.00, -0.10,  0.00},   /*  7 消行（弱） */
-    { 0.00, -0.10,  0.24,  0.00,  0.00,  0.00},   /*  8 行变化（弱） */
-    { 0.00,  0.00,  0.00,  0.24, -0.10,  0.00},   /*  9 列变化（弱） */
-    { 0.00, -0.10,  0.00,  0.00,  0.24,  0.00},   /* 10 洞数（弱） */
-    { 0.00,  0.00,  0.00,  0.00, -0.10,  0.24},   /* 11 井深（弱） */
-    { 0.18, -0.10,  0.00,  0.00,  0.00,  0.00},   /* 12 高度（更弱） */
-    { 0.00,  0.18,  0.00,  0.00, -0.10,  0.00},   /* 13 消行（更弱） */
-    { 0.00, -0.10,  0.18,  0.00,  0.00,  0.00},   /* 14 行变化（更弱） */
-    { 0.00,  0.00,  0.00,  0.18, -0.10,  0.00}    /* 15 列变化（更弱） */
-};
-static const double INITIAL_W2[HIDDEN_SIZE]={
-    0.02, -0.02, 0.015, -0.015, 0.02, -0.02, 0.015, -0.015,
-    0.02, -0.02, 0.015, -0.015, 0.02, -0.02, 0.015, -0.015
-};
-
-/* 清零：w2=0 时 Q 严格等于线性主干（测试里用它构造纯线性基准） */
-static void reset_hidden_layer(void){
-    memset(&hidden,0,sizeof(hidden));
-    target_hidden=hidden;
-}
-
-/* 装入源码里的初始参数；模型文件不存在、或 TRAIN_FRESH=1 时走这里 */
-static void init_hidden_layer(void){
-    memcpy(hidden.b1,INITIAL_B1,sizeof(hidden.b1));
-    memcpy(hidden.w1,INITIAL_W1,sizeof(hidden.w1));
-    memcpy(hidden.w2,INITIAL_W2,sizeof(hidden.w2));
-    target_hidden=hidden;
-}
-
 static void reset_value_model(void){
     const double initial_weights[FEATURE_COUNT]=
         {-45.0,34.0,-32.0,-93.0,-79.0,-34.0};
     memcpy(value_weights,initial_weights,sizeof(value_weights));
-    init_hidden_layer();
+    value_bias=0.0;
 }
 
 int place_block(int shape,int rotation,int x,int y,int fill[4],
@@ -331,21 +269,10 @@ typedef struct{
     double value;
 }training_action;
 
-static double hidden_unit_output(const hidden_layer *layer,int unit,
-                                 const double features[FEATURE_COUNT]){
-    double z=layer->b1[unit];
-    for(int j=0;j<FEATURE_COUNT;j++)
-        z+=layer->w1[unit][j]*features[j]*HIDDEN_INPUT_SCALE[j];
-    return tanh(z);
-}
-
-static double score_features(const double value_weights[FEATURE_COUNT],
-                             const hidden_layer *layer,
+static double score_features(const double weights[FEATURE_COUNT],double bias,
                              const double features[FEATURE_COUNT]){
-    double score=0.0;
-    for(int i=0;i<FEATURE_COUNT;i++)score+=value_weights[i]*features[i];
-    for(int h=0;h<HIDDEN_SIZE;h++)
-        score+=layer->w2[h]*hidden_unit_output(layer,h,features);
+    double score=bias;
+    for(int i=0;i<FEATURE_COUNT;i++)score+=weights[i]*features[i];
     return score;
 }
 static int extract_action_features(int shape,int rotation,int x,int y,int block_height,
@@ -393,37 +320,42 @@ int get_block(FILE *fp){
         default: return -1;
     }
 }
-static training_action generate_action(int shape,double epsilon,
-                                       const double value_weights[FEATURE_COUNT],
-                                       const hidden_layer *layer){
-    training_action actions[40];
-    int count=0;
-    training_action invalid={0};
-    if(shape<0||shape>=7)return invalid;
+#define MAX_ACTIONS 40
 
+/* 枚举 shape 的所有落点，填满 actions[]，返回动作个数。
+   shape 不是合法方块（EOF / -1 / 7）时返回 0，并把 40 个动作全部置零。 */
+static int evaluate_action(int shape,const double weights[FEATURE_COUNT],
+                           double bias,training_action actions[MAX_ACTIONS]){
+    memset(actions,0,sizeof(training_action)*MAX_ACTIONS);
+    if(shape<0||shape>=7)return 0;
+    int count=0;
     for(int rotation=0;rotation<block_r[shape];rotation++){
         for(int x=0;x<10;x++){
             if(!can_place(shape,rotation,x,16))continue;
             int y=simulate_fall(shape,rotation,x);
             if(y<0||y>=20)continue;
-            training_action *action=&actions[count++];
+            training_action *action=&actions[count];
+            if(!extract_action_features(shape,rotation,x,y,
+                                        block_h[shape][rotation],
+                                        action->features))
+                continue;
             action->valid=1;
             action->rotation=rotation;
             action->x=x;
             action->y=y;
             action->top_out=y+block_h[shape][rotation]>14;
-            if(!extract_action_features(shape,rotation,x,y,
-                                        block_h[shape][rotation],
-                                        action->features)){
-                action->valid=0;
-                count--;
-                continue;
-            }
-            action->value=score_features(value_weights,layer,action->features);
+            action->value=score_features(weights,bias,action->features);
+            count++;
         }
     }
-    if(count==0)return invalid;
+    return count;
+}
 
+/* 从候选里挑一个：按 epsilon 随机；否则在非顶出的动作里取 Q 最大 */
+static training_action generate_action(const training_action actions[MAX_ACTIONS],
+                                       int count,double epsilon){
+    training_action invalid={0};
+    if(count<=0)return invalid;
     int selected=-1;
     if((double)rand()/((double)RAND_MAX+1.0)<epsilon){
         selected=rand()%count;
@@ -438,8 +370,23 @@ static training_action generate_action(int shape,double epsilon,
     return actions[selected];
 }
 
+/* 环境交互：把动作真正落到棋盘上，返回这一步的奖励（放不下返回 NAN）。
+   奖励只有消行分 0/100/300/500/800，存活奖励和顶出惩罚都去掉了。 */
+static double environment_step(int shape,const training_action *action,
+                               int *line_score){
+    int fill[4],full_rows[4],fill_line;
+    int score=place_block(shape,action->rotation,action->x,action->y,
+                          fill,full_rows,&fill_line);
+    if(score<0)return NAN;
+    clear_lines(full_rows,fill_line);
+    if(line_score)*line_score=score;
+    return (double)score;
+}
+
 void find_best_position(int shape,int* rotation,int* x,int* y){
-    training_action action=generate_action(shape,0.0,value_weights,&hidden);
+    training_action actions[MAX_ACTIONS];
+    int count=evaluate_action(shape,value_weights,value_bias,actions);
+    training_action action=generate_action(actions,count,0.0);
     if(!action.valid){
         *rotation=0;
         *x=0;
@@ -459,46 +406,40 @@ static int load_value_model(const char *path){
         return -1;
     }
     double loaded[FEATURE_COUNT];
-    hidden_layer loaded_hidden;
-    memset(&loaded_hidden,0,sizeof(loaded_hidden));
+    double loaded_bias=0.0;
     char tag[16];
+    int ok=0;
     if(fscanf(fp,"%15s",tag)!=1){
         fprintf(stderr,"价值模型格式错误：%s\n",path);
         fclose(fp);
         return -1;
     }
-    int ok=0;
     if(strcmp(tag,"mlp")==0){
+        /* 旧版带隐藏层的文件："mlp 16" 之后就是 6 个主干权重，其余忽略 */
         int size=0;
-        if(fscanf(fp,"%d",&size)==1&&size==HIDDEN_SIZE){
-            ok=1;
-            for(int i=0;i<FEATURE_COUNT&&ok;i++)
-                ok=fscanf(fp,"%lf",&loaded[i])==1&&isfinite(loaded[i]);
-            for(int h=0;h<HIDDEN_SIZE&&ok;h++)
-                ok=fscanf(fp,"%lf",&loaded_hidden.b1[h])==1&&
-                   isfinite(loaded_hidden.b1[h]);
-            for(int h=0;h<HIDDEN_SIZE&&ok;h++)
-                for(int j=0;j<FEATURE_COUNT&&ok;j++)
-                    ok=fscanf(fp,"%lf",&loaded_hidden.w1[h][j])==1&&
-                       isfinite(loaded_hidden.w1[h][j]);
-            for(int h=0;h<HIDDEN_SIZE&&ok;h++)
-                ok=fscanf(fp,"%lf",&loaded_hidden.w2[h])==1&&
-                   isfinite(loaded_hidden.w2[h]);
+        if(fscanf(fp,"%d",&size)!=1){
+            fprintf(stderr,"价值模型格式错误：%s\n",path);
+            fclose(fp);
+            return -1;
         }
-    }else if(sscanf(tag,"%lf",&loaded[0])==1&&isfinite(loaded[0])){
-        /* 旧格式：只有 6 个线性权重，隐藏层保持全 0（等价于原模型） */
         ok=1;
+        for(int i=0;i<FEATURE_COUNT&&ok;i++)
+            ok=fscanf(fp,"%lf",&loaded[i])==1&&isfinite(loaded[i]);
+        /* 旧文件没有偏置，按 0 处理 */
+    }else{
+        ok=sscanf(tag,"%lf",&loaded[0])==1&&isfinite(loaded[0]);
         for(int i=1;i<FEATURE_COUNT&&ok;i++)
             ok=fscanf(fp,"%lf",&loaded[i])==1&&isfinite(loaded[i]);
-    }
-    if(!ok){
-        fprintf(stderr,"价值模型格式错误：%s\n",path);
-        fclose(fp);
-        return -1;
+        double extra=0.0;
+        if(ok&&fscanf(fp,"%lf",&extra)==1&&isfinite(extra))loaded_bias=extra;
     }
     fclose(fp);
+    if(!ok){
+        fprintf(stderr,"价值模型格式错误：%s\n",path);
+        return -1;
+    }
     for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=loaded[i];
-    hidden=loaded_hidden;
+    value_bias=loaded_bias;
     return 1;
 }
 
@@ -508,13 +449,8 @@ static int save_value_model(const char *path){
         fprintf(stderr,"无法保存价值模型 %s\n",path);
         return 0;
     }
-    fprintf(fp,"mlp %d\n",HIDDEN_SIZE);
     for(int i=0;i<FEATURE_COUNT;i++)fprintf(fp,"%.12g\n",value_weights[i]);
-    for(int h=0;h<HIDDEN_SIZE;h++)fprintf(fp,"%.12g\n",hidden.b1[h]);
-    for(int h=0;h<HIDDEN_SIZE;h++)
-        for(int j=0;j<FEATURE_COUNT;j++)
-            fprintf(fp,"%.12g\n",hidden.w1[h][j]);
-    for(int h=0;h<HIDDEN_SIZE;h++)fprintf(fp,"%.12g\n",hidden.w2[h]);
+    fprintf(fp,"%.12g\n",value_bias);
     if(fclose(fp)!=0){
         fprintf(stderr,"保存价值模型失败：%s\n",path);
         return 0;
@@ -550,16 +486,13 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
     }
 
     double gradients[FEATURE_COUNT]={0.0};
-    double grad_w2[HIDDEN_SIZE]={0.0};
-    double grad_b1[HIDDEN_SIZE]={0.0};
-    double grad_w1[HIDDEN_SIZE][FEATURE_COUNT];
-    memset(grad_w1,0,sizeof(grad_w1));
+    double gradient_bias=0.0;
     for(int sample=0;sample<batch_size;sample++){
         const replay_transition *transition=&batch[sample];
-        double current_value=score_features(value_weights,&hidden,
+        double current_value=score_features(value_weights,value_bias,
                                             transition->action.features);
         double next_value=transition->terminal?0.0:
-            score_features(target_weights,&target_hidden,
+            score_features(target_weights,target_bias,
                            transition->next_features);
         double target=transition->reward+
             (transition->terminal?0.0:gamma*next_value);
@@ -579,20 +512,7 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
                   transition->action.features[i];
         for(int i=0;i<FEATURE_COUNT;i++)
             gradients[i]+=clipped_td*transition->action.features[i]/norm;
-
-        /* 隐藏层反向传播：dQ/dw2[h]=tanh(z_h)，
-           dQ/dw1[h][j]=w2[h]·tanh'(z_h)·x_j，dQ/db1[h]=w2[h]·tanh'(z_h) */
-        for(int h=0;h<HIDDEN_SIZE;h++){
-            double out=hidden_unit_output(&hidden,h,
-                                          transition->action.features);
-            double slope=1.0-out*out;
-            double upstream=clipped_td*hidden.w2[h]*slope/norm;
-            grad_w2[h]+=clipped_td*out/norm;
-            grad_b1[h]+=upstream;
-            for(int j=0;j<FEATURE_COUNT;j++)
-                grad_w1[h][j]+=upstream*
-                    transition->action.features[j]*HIDDEN_INPUT_SCALE[j];
-        }
+        gradient_bias+=clipped_td/norm;
     }
 
     double after[FEATURE_COUNT];
@@ -603,31 +523,13 @@ static int update_dqn_batch(const replay_transition batch[DQN_BATCH_SIZE],
             return 0;
         }
     }
-    double delta_w2[HIDDEN_SIZE],delta_b1[HIDDEN_SIZE];
-    double delta_w1[HIDDEN_SIZE][FEATURE_COUNT];
-    for(int h=0;h<HIDDEN_SIZE;h++){
-        delta_w2[h]=alpha*grad_w2[h]/batch_size;
-        delta_b1[h]=alpha*grad_b1[h]/batch_size;
-        for(int j=0;j<FEATURE_COUNT;j++)
-            delta_w1[h][j]=alpha*grad_w1[h][j]/batch_size;
-        if(!isfinite(delta_w2[h])||!isfinite(delta_b1[h])){
-            fprintf(stderr,"DQN 权重数值异常：hidden=%d\n",h);
-            return 0;
-        }
-    }
-    for(int h=0;h<HIDDEN_SIZE;h++)
-        for(int j=0;j<FEATURE_COUNT;j++)
-            if(!isfinite(hidden.w1[h][j]+delta_w1[h][j])){
-                fprintf(stderr,"DQN 权重数值异常：hidden=%d feature=%d\n",h,j);
-                return 0;
-            }
-
     for(int i=0;i<FEATURE_COUNT;i++)value_weights[i]=after[i];
-    for(int h=0;h<HIDDEN_SIZE;h++){
-        hidden.w2[h]+=delta_w2[h];
-        hidden.b1[h]+=delta_b1[h];
-        for(int j=0;j<FEATURE_COUNT;j++)hidden.w1[h][j]+=delta_w1[h][j];
+    double after_bias=value_bias+alpha*gradient_bias/batch_size;
+    if(!isfinite(after_bias)){
+        fprintf(stderr,"DQN 偏置数值异常\n");
+        return 0;
     }
+    value_bias=after_bias;
     return 1;
 }
 
@@ -664,6 +566,7 @@ static int trace_write_training_header(void){
         if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
                    i,i,i,i,i)<0)return 0;
     }
+    if(fprintf(trace,",bias_before,bias_after")<0)return 0;
     return fprintf(trace,"\n")>=0;
 }
 
@@ -693,6 +596,7 @@ typedef struct{
     double norm;
     int board_cells;
     double before[FEATURE_COUNT];
+    double bias_before;
 }trace_step_state;
 
 static trace_step_state trace_step;
@@ -703,9 +607,10 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
     trace_step.active=0;
     if(!trace_training_file)return 1;
 
+    /* 候选动作是挑动作前刚算的，与更新用的是同一版权重 */
     double current_value=action->value;
     double next_value=transition->terminal?0.0:
-        score_features(target_weights,&target_hidden,transition->next_features);
+        score_features(target_weights,target_bias,transition->next_features);
     double target=transition->reward+
         (transition->terminal?0.0:DQN_GAMMA*next_value);
     double td_error=target-current_value;
@@ -734,6 +639,7 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
     trace_step.norm=norm;
     trace_step.board_cells=trace_count_board_cells();
     memcpy(trace_step.before,value_weights,sizeof(trace_step.before));
+    trace_step.bias_before=value_bias;
     return 1;
 }
 
@@ -762,6 +668,11 @@ static int trace_end_step(void){
             return 0;
         }
     }
+    if(fprintf(trace_training_file,",%.17g,%.17g",
+               trace_step.bias_before,value_bias)<0){
+        fprintf(stderr,"写入训练追踪文件失败\n");
+        return 0;
+    }
     if(fprintf(trace_training_file,"\n")<0){
         fprintf(stderr,"写入训练追踪文件失败\n");
         return 0;
@@ -783,7 +694,7 @@ static int train_on_transition(const replay_transition *transition){
         dqn_update_count++;
         if(dqn_update_count%DQN_TARGET_UPDATE_INTERVAL==0){
             memcpy(target_weights,value_weights,sizeof(target_weights));
-            target_hidden=hidden;
+            target_bias=value_bias;
         }
     }
     return 1;
@@ -793,31 +704,30 @@ static int train_value_episode(FILE *block_input,int episode,
                                double epsilon,int *has_training_data){
     memset(board,0,sizeof(board));
     *has_training_data=0;
+
     int shape=get_block(block_input);
+    training_action actions[MAX_ACTIONS];
+    training_action next_actions[MAX_ACTIONS];
+
     for(unsigned long long turn=1;;turn++){
-        training_action action=generate_action(shape,epsilon,value_weights,&hidden);
+        /* 每次挑动作前都按当前权重重算候选，避免用到上一次更新之前的旧 Q */
+        int count=evaluate_action(shape,value_weights,value_bias,actions);
+        training_action action=generate_action(actions,count,epsilon);
         if(!action.valid){
             fprintf(stderr,"无法生成训练动作：episode=%d turn=%llu\n",
                     episode,turn);
             return 0;
         }
 
-        int fill[4],full_rows[4],fill_line;
-        int score=place_block(shape,action.rotation,action.x,action.y,
-                              fill,full_rows,&fill_line);
-        if(score<0){
+        int line_score=0;
+        double reward=environment_step(shape,&action,&line_score);
+        if(!isfinite(reward)){
             fprintf(stderr,"训练动作无法放置：episode=%d turn=%llu\n",
                     episode,turn);
             return 0;
         }
-        clear_lines(full_rows,fill_line);
 
         int terminal=action.top_out;
-        double reward=score+1.0;
-        if(action.top_out)
-            reward-=DQN_EARLY_END_PENALTY*
-                    exp(-(double)(turn-1)/DQN_EARLY_END_DECAY);
-
         int next_shape=-1;
         replay_transition transition={0};
         transition.action=action;
@@ -826,8 +736,13 @@ static int train_value_episode(FILE *block_input,int episode,
             next_shape=get_block(block_input);
             terminal=next_shape<0||next_shape==7;
             if(!terminal){
+                /* bootstrap 用的是贝尔曼目标里的那一网络：候选按目标模型打分，
+                   选出来的 next_action 只用来取特征，不参与下一轮的动作生成
+                   （下一轮会按最新权重重新 evaluate）。 */
+                int next_count=evaluate_action(next_shape,target_weights,
+                                               target_bias,next_actions);
                 training_action next_action=
-                    generate_action(next_shape,0.0,target_weights,&target_hidden);
+                    generate_action(next_actions,next_count,0.0);
                 if(!next_action.valid){
                     fprintf(stderr,
                             "无法生成后继动作：episode=%d turn=%llu\n",
@@ -840,12 +755,14 @@ static int train_value_episode(FILE *block_input,int episode,
         }
         transition.terminal=terminal;
 
-        trace_begin_step(episode,turn,shape,&action,epsilon,score,&transition);
+        trace_begin_step(episode,turn,shape,&action,epsilon,line_score,
+                         &transition);
         if(!train_on_transition(&transition))
             return 0;
         trace_end_step();
         *has_training_data=1;
         if(terminal)break;
+
         shape=next_shape;
     }
     return 1;
@@ -855,6 +772,7 @@ static int train_value_model(int episodes,const char *input_path,
                              int *completed_episodes){
     srand((unsigned int)time(NULL));
     memcpy(target_weights,value_weights,sizeof(target_weights));
+    target_bias=value_bias;
     replay_size=0;
     replay_next=0;
     dqn_update_count=0;
@@ -979,7 +897,7 @@ int main(int argc,char **argv){
     }
     if(fresh_model){
         reset_value_model();
-        printf("从源码里的初始参数开始（主干 6 个数 + 隐藏层初值，与 %s 相同）\n",
+        printf("从源码里的初始参数开始（与 %s 相同）\n",
                VALUE_MODEL_PATH);
     }else{
         int loaded=load_value_model(VALUE_MODEL_PATH);
@@ -988,8 +906,6 @@ int main(int argc,char **argv){
             return 1;
         }
         if(loaded==0){
-            /* 没有模型文件：用源码里的同一组初值，隐藏层也不会退化成全 0 */
-            init_hidden_layer();
             printf("找不到模型文件 %s，从源码里的初始参数开始\n",VALUE_MODEL_PATH);
         }
     }
@@ -1027,9 +943,8 @@ int main(int argc,char **argv){
         printf("训练完成：%d 局，模型已保存到 %s\n",completed_episodes,
                VALUE_MODEL_PATH);
         for(int i=0;i<FEATURE_COUNT;i++)
-            printf("w%d=%.6f%c",i,value_weights[i],i+1==FEATURE_COUNT?'\n':' ');
-        printf("隐藏层：%d 个 tanh 单元（残差连接，w2 全 0 时等价于线性模型）\n",
-               HIDDEN_SIZE);
+            printf("w%d=%.6f ",i,value_weights[i]);
+        printf("b=%.6f\n",value_bias);
         return 0;
     }
 

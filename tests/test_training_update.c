@@ -24,7 +24,8 @@ static void reset_weights(void){
         value_weights[i]=0.0;
         target_weights[i]=0.0;
     }
-    reset_hidden_layer();   /* 隐藏层归零，使 Q 退化为纯线性模型 */
+    value_bias=0.0;
+    target_bias=0.0;
 }
 
 static void test_terminal_target_uses_only_reward(void){
@@ -34,7 +35,7 @@ static void test_terminal_target_uses_only_reward(void){
     batch[0].action.features[0]=1.0;
     batch[0].reward=10.0;
     batch[0].terminal=1;
-    batch[0].next_features[1]=100.0;
+    batch[0].next_features[1]=100.0;   /* 终局时应该被忽略 */
     target_weights[1]=100.0;
 
     if(!update_dqn_batch(batch,1,0.1,0.5))
@@ -51,8 +52,8 @@ static void test_bootstrap_target_updates_current_action(void){
     memset(batch,0,sizeof(batch));
     batch[0].action.features[0]=2.0;
     batch[0].next_features[1]=1.0;
-    batch[0].reward=3.0;
     target_weights[1]=4.0;
+    batch[0].reward=3.0;
 
     if(!update_dqn_batch(batch,1,0.1,0.5))
         fail("bootstrapped DQN update failed");
