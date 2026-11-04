@@ -19,7 +19,7 @@
 
 /* 训练局数（命令行不再接受数字） */
 #ifndef TRAIN_EPISODES
-#define TRAIN_EPISODES 2000
+#define TRAIN_EPISODES 20000
 #endif
 /* 是否忽略已保存的模型、从源码里的初始值开始训练：1 = 忽略，0 = 沿用
    模型文件。初始值就是上面 value_weights 的 6 个数，选 1 时不读文件。 */
@@ -44,17 +44,17 @@
 /* 回放区攒满多少条才开始更新 */
 #define DQN_REPLAY_WARMUP 64
 /* 每多少次批量更新同步一次目标网络 */
-#define DQN_TARGET_UPDATE_INTERVAL 10
+#define DQN_TARGET_UPDATE_INTERVAL 500
 /* 折扣因子 */
 #define DQN_GAMMA 0.99
 /* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
 #ifndef DQN_LEARNING_RATE
-#define DQN_LEARNING_RATE 0.0004
+#define DQN_LEARNING_RATE 0.001
 #endif
 /* 奖励缩放：棋盘上的消行分 0/100/300/500/800 乘这个系数才是训练奖励，
    0.01 即奖励变成 0~8，TD 和梯度的量级同步缩小 100 倍。 */
 #ifndef REWARD_SCALE
-#define REWARD_SCALE 1
+#define REWARD_SCALE 0.01
 #endif
 /* Adam 的超参 */
 #ifndef ADAM_BETA1
@@ -85,7 +85,7 @@
    整体平滑下降，而不是每批都重新从高处探索一遍。
    两个值设成一样就是固定 epsilon（现在的默认值），便于做可复现实验。 */
 #ifndef TRAIN_EPSILON_START
-#define TRAIN_EPSILON_START 0.05
+#define TRAIN_EPSILON_START 1
 #endif
 #ifndef TRAIN_EPSILON_END
 #define TRAIN_EPSILON_END 0.05
