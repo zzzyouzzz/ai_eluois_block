@@ -42,9 +42,9 @@
 /* 每次批量更新抽多少条样本 */
 #define DQN_BATCH_SIZE 32
 /* 回放区攒满多少条才开始更新 */
-#define DQN_REPLAY_WARMUP 64
+#define DQN_REPLAY_WARMUP 5000
 /* 每多少次批量更新同步一次目标网络 */
-#define DQN_TARGET_UPDATE_INTERVAL 500
+#define DQN_TARGET_UPDATE_INTERVAL 800
 /* 折扣因子 */
 #define DQN_GAMMA 0.99
 /* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
@@ -415,7 +415,7 @@ static int environment_step(const state_and_action *action,FILE *input,
                               fill,full_rows,&fill_line);
         if(score<0)return -1;
         clear_lines(full_rows,fill_line);
-        if(reward)*reward=(double)score*REWARD_SCALE;
+        if(reward)*reward=(double)score*REWARD_SCALE-(action->top_out?10.0:0.0)-0.005*action->feature[4]-0.001*action->feature[0];
     }
     /* 枚举下一个方块的全部落点，直接写进 next[]：只填 feature 与落法，不算价值 */
     int shape=get_block(input);
