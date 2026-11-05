@@ -671,7 +671,7 @@ typedef struct{
 
 static trace_step_state trace_step;
 
-static int trace_begin_step(int episode,unsigned long long turn,int shape,
+static int trace_begin_step(int episode,unsigned long long turn,
                             const state_and_action *action,double epsilon,
                             const replay_transition *transition){
     trace_step.active=0;
@@ -713,7 +713,7 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
     trace_step.active=1;
     trace_step.episode=episode;
     trace_step.turn=turn;
-    trace_step.shape=shape;
+    trace_step.shape=action->shape;
     trace_step.action=*action;
     trace_step.epsilon=epsilon;
     trace_step.score=score;
@@ -810,7 +810,6 @@ static int train_value_episode(FILE *block_input,int episode,
                     episode,turn);
             return 0;
         }
-        int shape=action.shape;
 
         /* 先占一个回放槽，再让环境把下一个方块的候选直接写进槽里的 next[]：
            全程没有“候选数组 → transition → 回放”的整块拷贝 */
@@ -828,7 +827,7 @@ static int train_value_episode(FILE *block_input,int episode,
         transition->next_count=count;
         candidates=transition->next;    /* 下一轮直接在这份候选上挑 */
 
-        trace_begin_step(episode,turn,shape,&action,epsilon,transition);
+        trace_begin_step(episode,turn,&action,epsilon,transition);
         if(!train_on_transition())
             return 0;
         trace_end_step();
