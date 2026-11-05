@@ -73,6 +73,7 @@ def load_training_trace(path, episode_offset=0):
         "score",
         "terminal",
         "td_error",
+        "current_value",
         "board_cells",
     }
     required.update(f"feature{i}" for i in range(6))
@@ -84,6 +85,7 @@ def load_training_trace(path, episode_offset=0):
             "steps": 0,
             "epsilon_sum": 0.0,
             "td_abs_sum": 0.0,
+            "value_abs_sum": 0.0,
             "top_outs": 0,
             "line_clears": 0,
             "features": [0.0] * 6,
@@ -122,6 +124,7 @@ def load_training_trace(path, episode_offset=0):
                 ]
                 terminal = int(parse_number(row, "terminal", row_number))
                 td_error = parse_number(row, "td_error", row_number)
+                current_value = parse_number(row, "current_value", row_number)
                 board_cells = parse_number(row, "board_cells", row_number)
                 bias = (
                     parse_number(row, "bias_after", row_number)
@@ -149,6 +152,7 @@ def load_training_trace(path, episode_offset=0):
             if bias is not None:
                 data["bias"] = bias
             data["td_abs_sum"] += abs(td_error)
+            data["value_abs_sum"] += abs(current_value)
             rows += 1
 
     if not episodes:
@@ -162,6 +166,10 @@ def load_training_trace(path, episode_offset=0):
             "steps": steps,
             "epsilon": data["epsilon_sum"] / steps,
             "td_abs": data["td_abs_sum"] / steps,
+            # 相对 TD 误差：Σ|TD| / Σ|V|。绝对 |TD| 会随价值尺度等比放大，
+            # 只有这个比值能区分"价值尺度在涨"和"真的学歪了"。
+            # 用比值的和（而不是每步比值的均值）：小 V 的早期步不会把比值放大。
+            "rel_td": data["td_abs_sum"] / max(data["value_abs_sum"], 1e-9),
             "top_out_rate": data["top_outs"] / steps,
             "line_clears_per_move": data["line_clears"] / steps,
             "features": [value / steps for value in data["features"]],
@@ -327,18 +335,31 @@ def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=No
         color="#c62828",
         label="顶出率",
     )
-    axes[2, 1].plot(
-        episode_ids,
-        rolling_mean(
-            [episodes[e]["td_abs"] for e in episode_ids], window
-        ),
-        color="#455a64",
-        label="平均绝对 TD 误差",
+    # 绝对 |TD| 会跟着价值尺度一起涨，和消行率画在同一根轴上是误导：
+    # 这里改用无量纲的相对误差 Σ|TD|/Σ|V|，单独一根右轴
+    rel_td_series = rolling_mean(
+        [episodes[e]["rel_td"] for e in episode_ids], window
     )
+    rel_td_axis = axes[2, 1].twinx()
+    rel_td_axis.plot(
+        episode_ids,
+        rel_td_series,
+        color="#455a64",
+        linewidth=1.7,
+        label=f"相对 TD 误差 Σ|TD|/Σ|V|（{window} 局）",
+    )
+    rel_td_axis.set_ylabel("Σ|TD| / Σ|V|")
+    # 相对误差跨数量级（开局 ≈1，收敛到 0.03），跨度超过一个数量级时才用
+    # 对数轴——短训练（几百局）跨度很小，对数轴只会把刻度弄得很别扭
+    positives = [value for value in rel_td_series if value > 0]
+    if len(positives) > 1 and max(positives) > 10.0 * min(positives):
+        rel_td_axis.set_yscale("log")
     axes[2, 1].set_title("训练稳定性与消行效率")
     axes[2, 1].set_xlabel("训练局数")
     axes[2, 1].set_ylabel("滚动均值 / 比率")
-    axes[2, 1].legend(fontsize=8)
+    handles, labels = axes[2, 1].get_legend_handles_labels()
+    other_handles, other_labels = rel_td_axis.get_legend_handles_labels()
+    axes[2, 1].legend(handles + other_handles, labels + other_labels, fontsize=8)
     axes[2, 1].grid(alpha=0.25)
 
     ax_test = axes[3, 0]
@@ -362,17 +383,19 @@ def plot_training(trace_paths, episodes, rows, window, output_path, test_rows=No
         ax_test.set_axis_off()
         bias_ax = axes[3, 1]
 
-    # 偏置 b：线性模型里唯一不带特征的参数，画在最后一格
+    # 偏置 b（=ρ）：线性模型里唯一不带特征的参数。它只把整个价值抬高一个常数，
+    # 在 argmax 里会被减掉、根本不改变策略，所以单独一格、单独一根轴，
+    # 不要和 w0..w5 比大小。
     if any(value is not None for value in biases):
         bias_ax.plot(
             episode_ids,
             biases,
             color="#00695c",
             linewidth=1.5,
-            label="偏置 b",
+            label="偏置 b（=ρ 差分项）",
         )
         bias_ax.axhline(0, color="black", linewidth=0.7, alpha=0.5)
-        bias_ax.set_title("偏置 b 的变化")
+        bias_ax.set_title("偏置 b 的变化（价值尺度，不影响 argmax）")
         bias_ax.set_xlabel("训练局数")
         bias_ax.set_ylabel("b")
         bias_ax.legend(fontsize=8)

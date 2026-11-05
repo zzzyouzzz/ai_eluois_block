@@ -616,6 +616,11 @@ static replay_transition *replay_reserve(void){
 
 static FILE *trace_training_file;
 
+/* 相对 TD 误差的分母下限，单位是奖励（1 = 消一行）。
+   开局权重全是 0，V(s') 恰好等于 0，|TD|/|V| 会炸成无穷；
+   把分母钳在这条地板上，只有最开始那一两步会碰到，之后一律是真比值。 */
+#define TRACE_REL_TD_FLOOR 1e-3
+
 static void trace_attach(FILE *training){
     trace_training_file=training;
 }
@@ -630,7 +635,7 @@ static int trace_write_training_header(void){
         if(fprintf(trace,",feature%d,weight_before%d,contribution%d,weight_delta%d,weight_after%d",
                    i,i,i,i,i)<0)return 0;
     }
-    if(fprintf(trace,",bias_before,bias_after")<0)return 0;
+    if(fprintf(trace,",bias_before,bias_after,rel_td_error")<0)return 0;
     return fprintf(trace,"\n")>=0;
 }
 
@@ -657,6 +662,7 @@ typedef struct{
     double next_value;
     double target;
     double td_error;
+    double rel_td;
     double norm;
     int board_cells;
     double before[FEATURE_COUNT];
@@ -696,6 +702,14 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
         return 0;
     }
 
+    /* 判断训练是否在发散要看相对误差：|TD| 的绝对量会随价值尺度 V 一起变大，
+        只有 |TD|/|V| 这种无量纲比值才是"学得好不好"的证据。
+        分母只在地板处钳位（V 恰好为 0 的最初一两步），不是给每步加常数——
+        加法地板会把早期的小 V 稀释成 1.0，比值被压小、趋势直接反过来。 */
+    double rel_td_denom=fabs(current_value);
+    if(rel_td_denom<TRACE_REL_TD_FLOOR)rel_td_denom=TRACE_REL_TD_FLOOR;
+    double rel_td=fabs(td_error)/rel_td_denom;
+
     trace_step.active=1;
     trace_step.episode=episode;
     trace_step.turn=turn;
@@ -709,6 +723,7 @@ static int trace_begin_step(int episode,unsigned long long turn,int shape,
     trace_step.next_value=next_value;
     trace_step.target=target;
     trace_step.td_error=td_error;
+    trace_step.rel_td=rel_td;
     trace_step.norm=norm;
     trace_step.board_cells=trace_count_board_cells();
     memcpy(trace_step.before,value_weights,sizeof(trace_step.before));
@@ -741,8 +756,8 @@ static int trace_end_step(void){
             return 0;
         }
     }
-    if(fprintf(trace_training_file,",%.17g,%.17g",
-               trace_step.bias_before,value_bias)<0){
+    if(fprintf(trace_training_file,",%.17g,%.17g,%.17g",
+               trace_step.bias_before,value_bias,trace_step.rel_td)<0){
         fprintf(stderr,"写入训练追踪文件失败\n");
         return 0;
     }
@@ -832,14 +847,33 @@ static int train_value_model(int episodes,const char *input_path,
     dqn_update_count=0;
     *completed_episodes=0;
 
+    /* 方块流只打开一次。以前是每局 fopen/fclose，等于每局都从文件第 1 个
+       方块重新开始，100 万方块的输入每局只用到开头几十个；现在句柄跨局
+       持有，上一局停在哪、下一局就从哪接着读，读穿整份文件才回绕。
+       读取接口没动：get_block / environment_step 仍然只收一个 FILE *。 */
+    FILE *block_input=stdin;
+    int owns_input=0;
+    if(input_path&&strcmp(input_path,"-")!=0){
+        block_input=fopen(input_path,"r");
+        if(!block_input){
+            fprintf(stderr,"无法打开训练输入文件 %s\n",input_path);
+            return 0;
+        }
+        owns_input=1;
+    }
+
+    int wraps=0,success=1;
     for(int episode=0;episode<episodes;episode++){
-        FILE *block_input=stdin;
-        if(input_path&&strcmp(input_path,"-")!=0){
-            block_input=fopen(input_path,"r");
-            if(!block_input){
-                fprintf(stderr,"无法打开训练输入文件 %s\n",input_path);
-                return 0;
+        /* 上一局把文件读到 EOF 才回绕。文本流只允许 seek 到 0 这类魔法值，
+           不能拿 ftell 返回的偏移去 fseek（Windows 上还带 CRLF 转换）。 */
+        if(owns_input&&feof(block_input)){
+            if(fseek(block_input,0,SEEK_SET)!=0){
+                fprintf(stderr,"无法回绕训练输入文件 %s\n",input_path);
+                success=0;
+                break;
             }
+            clearerr(block_input);
+            wraps++;
         }
 
         /* 第 0 局用 START、最后一局正好用 END：上一批的 END 就是
@@ -849,17 +883,31 @@ static int train_value_model(int episodes,const char *input_path,
             epsilon+=(TRAIN_EPSILON_END-TRAIN_EPSILON_START)*
                      (double)episode/(double)(episodes-1);
         if(epsilon<TRAIN_EPSILON_END)epsilon=TRAIN_EPSILON_END;
+
         int has_training_data=0;
-        int success=train_value_episode(block_input,episode+1,epsilon,&has_training_data);
-        if(block_input!=stdin&&fclose(block_input)!=0){
-            fprintf(stderr,"关闭训练输入文件失败：%s\n",input_path);
-            return 0;
+        if(!train_value_episode(block_input,episode+1,epsilon,
+                                &has_training_data)){
+            success=0;
+            break;
         }
-        if(!success)return 0;
+        /* get_block 把 EOF 和读错误都报成 -666，只能在这一层区分：
+           feof 为假而 ferror 为真就是真读失败，别当成"输入读完了"。 */
+        if(owns_input&&ferror(block_input)){
+            fprintf(stderr,"读取训练输入文件失败：%s\n",input_path);
+            success=0;
+            break;
+        }
         if(!has_training_data)break;
         (*completed_episodes)++;
     }
-    return 1;
+
+    if(owns_input&&fclose(block_input)!=0){
+        fprintf(stderr,"关闭训练输入文件失败：%s\n",input_path);
+        return 0;
+    }
+    if(success&&wraps>0)
+        printf("训练输入顺序读完 %d 遍（回绕 %d 次）\n",wraps+1,wraps);
+    return success;
 }
 
 static int run_game(FILE *input){
@@ -908,7 +956,7 @@ static int run_game(FILE *input){
             break;
         }
     }
-    printf("耗时：%d ms\n",clock()-start);
+    printf("耗时：%ld ms\n",(long)(clock()-start));
     return 0;
 }
 int main(int argc,char **argv){

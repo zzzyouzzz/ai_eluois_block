@@ -74,9 +74,9 @@ gcc -DTRAIN_EPISODES=200 -DREWARD_SCALE=1.0 -DTRAINING_TRACE_PATH='"batch.csv"' 
 | Adam | `ADAM_BETA1` / `ADAM_BETA2` / `ADAM_EPSILON` | 0.9 / 0.999 / 1e-8 | Adam 超参 |
 | Adam | `DQN_LR_DECAY_STEPS` | 0 | 0 = 不衰减；N = 每 N 步学习率减半 |
 | 差分 | `DQN_RHO_RATE` | 0.01 | 基线 ρ 的学习率：`ρ += rate · 批内平均 TD` |
-| 探索 | `TRAIN_EPSILON_START` / `TRAIN_EPSILON_END` | 0.05 / 0.05 | 每局 ε 从 START 线性到 END |
+| 探索 | `TRAIN_EPSILON_START` / `TRAIN_EPSILON_END` | 1 / 0.05 | 每局 ε 从 START 线性到 END |
 
-`START == END` 即固定 ε（当前默认，便于可复现实验）；写成 0.35 / 0.05 就是退火。
+`START == END` 即固定 ε（如 0.05/0.05，便于可复现实验）；源码默认 1/0.05，即退火。
 
 ## 3. 算法
 
@@ -185,9 +185,9 @@ w_i += alpha · (m/c1) / (sqrt(v/c2) + eps);   // c1/c2 为偏差修正
 | 回放区 | 507–525 | `replay_transition`、`replay_buffer`、`random_below` |
 | 学习 | 527–603 | `update_dqn_batch`（Adam + ρ）、`replay_reserve` |
 | 追踪 | 606–758 | `trace_*` 一组（整段可删） |
-| 训练 | 760–863 | `train_on_transition` / `train_value_episode` / `train_value_model` |
-| 对局 | 865–912 | `run_game` |
-| 入口 | 914–1020 | `main` |
+| 训练 | 775–911 | `train_on_transition` / `train_value_episode` / `train_value_model`（方块流在这里 open 一次） |
+| 对局 | 913–961 | `run_game` |
+| 入口 | 962–1068 | `main` |
 
 ## 6. 训练一局的完整时序
 
@@ -211,17 +211,20 @@ for (turn = 1; ; turn++) {
 }
 ```
 
-三个设计要点：
+四个设计要点：
 
 1. **枚举只发生在 `environment_step` 里**——`can_place` → `simulate_fall` →
    `extract_action_features` → 填 `r/x/y/top_out`。`generate_action` 只做"算 value + 采样"。
 2. **候选直接落进回放槽**：`environment_step` 往 `transition->next` 里写，全程没有
    3.2 KB 的整块拷贝。
 3. **每轮重新算 value**：`action.value` 必须用当前权重现算，否则会比权重滞后一步。
+4. **方块流是跨局的**：`train_value_model` 只 `fopen` 一次，句柄跨局持有——
+   上一局停在哪、下一局就从哪接着读，读穿整份文件才 `fseek(fp,0,SEEK_SET)` 回绕。
+   `get_block` / `environment_step` 的接口没变，仍然只收一个 `FILE *`。
 
 ## 7. 追踪 CSV
 
-`TRAINING_TRACE_PATH` 非空时每个训练步写一行，共 **48 列**：
+`TRAINING_TRACE_PATH` 非空时每个训练步写一行，共 **49 列**：
 
 | 列 | 含义 |
 | --- | --- |
@@ -240,8 +243,17 @@ for (turn = 1; ; turn++) {
 | `feature0..5` | 6 个特征（消行**之后**的局面） |
 | `weight_before/contribution/weight_delta/weight_after` ×6 | 每个权重在本次更新前后的值与贡献 |
 | `bias_before, bias_after` | 基线 `b` 在本次更新前后的值 |
+| `rel_td_error` | 相对 TD 误差 `|TD| / max(|V|, 1e-3)`；判断收不收敛看这一列，别只看 `td_error` |
 
 `contribution_i = weight_before_i × φ_i`，可以直接看出哪个特征在主导价值。
+
+> **看收敛看 `rel_td_error`，不要看 `td_error` 的绝对值。** `|TD|` 会随价值尺度 `V`
+> 等比放大（`V` 涨 100 倍，`|TD|` 也涨 100 倍），曲线上像爆炸，实际相对误差可能在降。
+> 分母只在下限处钳位（`max(|V|, 1e-3)`），不是每步加常数——加法地板会把早期的小 `V`
+> 稀释成 1，比值被压小、趋势会反过来。
+> `analyze_training.py` 画图时按局聚合用 `Σ|TD| / Σ|V|`（比值的和，不是每步比值的均值），
+> 跨度超过一个数量级才切对数轴。
+> `b` 是纯平移量，在 argmax 里被减掉、不影响策略，只作"价值尺度/是否漂移"的参考。
 
 > ⚠️ **追踪与更新必须同口径**。曾在 `update_dqn_batch` 里漏写 `−ρ` 而 `trace_begin_step`
 > 里有，结果 ρ 变成只进不出的积分器，一路涨到 12 万——见 §10 L2。
@@ -250,7 +262,7 @@ for (turn = 1; ; turn++) {
 
 | 文件 | 作用 |
 | --- | --- |
-| `analyze_training.py` | 读追踪 CSV：训练得分/存活步数、ε、6 权重、特征均值、贡献、TD、偏置，4×2 面板 |
+| `analyze_training.py` | 读追踪 CSV：训练得分/存活步数、ε、6 权重、特征均值、贡献、相对 TD 误差、偏置，4×2 面板 |
 | `correlate_features.py` | 专门看"消行 vs 普通步"：特征比、td×φ 推力、梯度质量占比、Δw2 归因、td 随分位变化 |
 | `plot_value_trajectory.py` | 局内 V 的轨迹（驼峰诊断）：V 沿进度、变化幅度、几局的 V(turn) |
 | `run_experiments.ps1` | 多批次实验：编译 → 训练 → 存模型快照 → 跑测试 → 记分 → 下一批 |
@@ -428,6 +440,9 @@ TD 的**带符号均值**是 −0.008（≈0）、40.5% 的步 TD>0——这是�
   退火把分布搅动时它就会一路漂（见 L13）。
 - **没有生存压力**：奖励只剩消行分，长局里死亡不产生额外代价。
 - **特征表达能力有限**：看不到"行内空洞分布""逐列高度差"，井深/洞数只能线性加权。
+- **读穿文件会截断一局**：方块流跨局顺序读（§6 第 4 点），文件读完时若正处在某一局中间，
+  这一局会提前结束——`get_block` 读到 EOF 返回 `-666`，上层按"候选为 0"收尾。
+  每读穿一遍最多损失一局，之后才回绕到文件头继续。
 - **README 的行号会过期**：改动代码后请以源码为准，或顺手更新附录 A。
 
 ## 附录 A 源码索引
@@ -457,11 +472,11 @@ TD 的**带符号均值**是 −0.008（≈0）、40.5% 的步 TD>0——这是�
 | 527 | `update_dqn_batch`（Adam + ρ） |
 | 598 | `replay_reserve` |
 | 606–758 | 追踪模块（`trace_attach` / header / `begin_step` / `end_step`） |
-| 760 | `train_on_transition` |
-| 777 | `train_value_episode` |
-| 825 | `train_value_model` |
-| 865 | `run_game` |
-| 914–1020 | `main` |
+| 775 | `train_on_transition` |
+| 792 | `train_value_episode` |
+| 840 | `train_value_model`（唯一打开训练输入的地方） |
+| 913 | `run_game` |
+| 962–1068 | `main` |
 
 ## 附录 B 从 Bellman 方程到 DQN
 
