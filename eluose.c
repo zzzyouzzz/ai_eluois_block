@@ -26,6 +26,13 @@
 #ifndef TRAIN_FRESH
 #define TRAIN_FRESH 0
 #endif
+/* 随机种子：0 = 用当前时间（每次训练都不一样，默认行为）；
+   非 0 = 固定种子，同样参数多次训练得到同一条轨迹。
+   sweep_hyperparams.py 给同一组对比实验传同一个种子，把随机噪声消掉，
+   差异才真的是参数造成的。 */
+#ifndef TRAIN_SEED
+#define TRAIN_SEED 0
+#endif
 /* 模型文件路径（训练结束写这里，平时从这里读） */
 #ifndef VALUE_MODEL_PATH
 #define VALUE_MODEL_PATH "q_weights.dat"
@@ -35,26 +42,50 @@
 #define TRAINING_TRACE_PATH "training_trace.csv"
 #endif
 
-/* ---------- DQN 训练参数 ---------- */
+/* ---------- DQN 训练参数 ----------
+   全部带 #ifndef：不然命令行 -D 会被下面的 #define 覆盖掉（编译器只给一句
+   redefined 警告），sweep_hyperparams.py 枚举出来的就是一串一模一样的结果。 */
 
 /* 经验回放区容量（条） */
+#ifndef DQN_REPLAY_CAPACITY
 #define DQN_REPLAY_CAPACITY 50000
+#endif
 /* 每次批量更新抽多少条样本 */
-#define DQN_BATCH_SIZE 32
+#ifndef DQN_BATCH_SIZE
+#define DQN_BATCH_SIZE 16
+#endif
 /* 回放区攒满多少条才开始更新 */
+#ifndef DQN_REPLAY_WARMUP
 #define DQN_REPLAY_WARMUP 5000
+#endif
 /* 每多少次批量更新同步一次目标网络 */
+#ifndef DQN_TARGET_UPDATE_INTERVAL
 #define DQN_TARGET_UPDATE_INTERVAL 800
+#endif
 /* 折扣因子 */
+#ifndef DQN_GAMMA
 #define DQN_GAMMA 0.99
+#endif
 /* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
 #ifndef DQN_LEARNING_RATE
-#define DQN_LEARNING_RATE 0.001
+#define DQN_LEARNING_RATE 0.0003
 #endif
 /* 奖励缩放：棋盘上的消行分 0/100/300/500/800 乘这个系数才是训练奖励，
    0.01 即奖励变成 0~8，TD 和梯度的量级同步缩小 100 倍。 */
 #ifndef REWARD_SCALE
 #define REWARD_SCALE 0.01
+#endif
+/* 奖励整形里三个惩罚项的系数（单位都是"奖励值"，1 = 消一行）：
+   顶出一次扣多少、每个洞扣多少、每格堆高扣多少。
+   都做成宏是为了能 -D 覆盖：sweep_hyperparams.py 就是靠这个枚举的。 */
+#ifndef PENALTY_TOP_OUT
+#define PENALTY_TOP_OUT 10.0
+#endif
+#ifndef PENALTY_HOLE
+#define PENALTY_HOLE 0.005
+#endif
+#ifndef PENALTY_HEIGHT
+#define PENALTY_HEIGHT 0.001
 #endif
 /* Adam 的超参 */
 #ifndef ADAM_BETA1
@@ -405,17 +436,24 @@ static state_and_action generate_action(state_and_action actions[MAX_ACTIONS],
    否则：落子、消行、读入下一个方块，把新候选直接覆盖到 next[]
          （调用方手里的 action 是副本，所以可以安全覆盖）。
    返回新候选个数（0 表示这一局结束），*reward 是这一步的奖励。
-   方块流由参数 input 传进来，get_block 只在这里调用。 */
+   *board_score（可为 NULL）回传这一步的棋盘得分 0/100/300/500/800，
+   和奖励分开：奖励里有惩罚项，评"打得好不好"必须看纯棋盘分。 */
 static int environment_step(const state_and_action *action,FILE *input,
-                            state_and_action next[MAX_ACTIONS],double *reward){
+                            state_and_action next[MAX_ACTIONS],double *reward,
+                            int *board_score){
     if(reward)*reward=0.0;
+    if(board_score)*board_score=0;
     if(action){
         int fill[4],full_rows[4],fill_line;
         int score=place_block(action->shape,action->r,action->x,action->y,
                               fill,full_rows,&fill_line);
         if(score<0)return -1;
         clear_lines(full_rows,fill_line);
-        if(reward)*reward=(double)score*REWARD_SCALE-(action->top_out?10.0:0.0)-0.005*action->feature[4]-0.001*action->feature[0];
+        if(board_score)*board_score=score;
+        if(reward)*reward=(double)score*REWARD_SCALE
+            -(action->top_out?PENALTY_TOP_OUT:0.0)
+            -PENALTY_HOLE*(double)action->feature[4]
+            -PENALTY_HEIGHT*(double)action->feature[0];
     }
     /* 枚举下一个方块的全部落点，直接写进 next[]：只填 feature 与落法，不算价值 */
     int shape=get_block(input);
@@ -508,7 +546,8 @@ typedef struct{
     state_and_action action;                 /* 这一步选中的落法 */
     int next_count;                          /* 下一状态的候选数，0 = 终局 */
     state_and_action next[MAX_ACTIONS];
-    double reward;
+    double reward;                           /* 训练奖励（含惩罚项，已缩放） */
+    int board_score;                         /* 纯棋盘分 0/100/300/500/800 */
 }replay_transition;
 
 
@@ -677,9 +716,9 @@ static int trace_begin_step(int episode,unsigned long long turn,
     trace_step.active=0;
     if(!trace_training_file)return 1;
 
-    /* 这里要的是棋盘上的原始消行分（0/100/300/500/800），
-       训练奖励已经乘过 REWARD_SCALE，除回去就是它 */
-    int score=(int)(transition->reward/REWARD_SCALE+0.5);
+    /* 要的是棋盘上的原始消行分（0/100/300/500/800）。不能拿 reward 除回去：
+       奖励里还有顶出/洞/高度三个惩罚项，除出来的分数会被惩罚污染成负数 */
+    int score=transition->board_score;
 
     /* 与 update_dqn_batch 同一套差分口径：V = w·φ，ρ = value_bias */
     double current_value=action->value;
@@ -798,7 +837,7 @@ static int train_value_episode(FILE *block_input,int episode,
     state_and_action first_candidates[MAX_ACTIONS];
     state_and_action *candidates=first_candidates;
     double reward=0.0;
-    int count=environment_step(NULL,block_input,candidates,&reward);
+    int count=environment_step(NULL,block_input,candidates,&reward,NULL);
     if(count<=0)return 1;               /* 输入为空：这一局没有可训练的数据 */
 
     for(unsigned long long turn=1;;turn++){
@@ -816,7 +855,9 @@ static int train_value_episode(FILE *block_input,int episode,
         replay_transition *transition=replay_reserve();
         transition->action=action;
         transition->reward=reward;
-        count=environment_step(&action,block_input,transition->next,&reward);
+        transition->board_score=0;
+        count=environment_step(&action,block_input,transition->next,&reward,
+                               &transition->board_score);
         if(count<0){
             fprintf(stderr,"训练动作无法放置：episode=%d turn=%llu\n",
                     episode,turn);
@@ -838,7 +879,7 @@ static int train_value_episode(FILE *block_input,int episode,
 }
 static int train_value_model(int episodes,const char *input_path,
                              int *completed_episodes){
-    srand((unsigned int)time(NULL));
+    srand(TRAIN_SEED?(unsigned int)TRAIN_SEED:(unsigned int)time(NULL));
     memcpy(target_weights,value_weights,sizeof(target_weights));
     target_bias=value_bias;
     replay_size=0;
@@ -915,7 +956,8 @@ static int run_game(FILE *input){
 
     state_and_action candidates[MAX_ACTIONS];
     double reward=0.0;
-    int count=environment_step(NULL,input,candidates,&reward);
+    int step_score=0;
+    int count=environment_step(NULL,input,candidates,&reward,&step_score);
 
     while(count>0){
         int best=-1;
@@ -936,12 +978,14 @@ static int run_game(FILE *input){
         }
 
         state_and_action action=candidates[best];
-        count=environment_step(&action,input,candidates,&reward);
+        count=environment_step(&action,input,candidates,&reward,&step_score);
         if(count<0){
             fprintf(stderr,"无法放置方块\n");
             return 1;
         }
-        score+=(int)(reward/REWARD_SCALE+0.5);
+        /* 打印的是纯棋盘得分（消行分之和），不掺奖励里的惩罚项：
+           惩罚系数一改，掺进去的分数就没法跨实验比了 */
+        score+=step_score;
         printf("%d %d\n%d\n",action.r,action.x,score);
         fflush(stdout);
 

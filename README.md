@@ -61,22 +61,30 @@ gcc -DTRAIN_EPISODES=200 -DREWARD_SCALE=1.0 -DTRAINING_TRACE_PATH='"batch.csv"' 
 | 组 | 宏 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | 运行 | `TRAIN_EPISODES` | 20000 | 训练局数 |
-| 运行 | `TRAIN_FRESH` | 0 | 1 = 忽略模型文件，从源码初始权重开始 |
+| 运行 | `TRAIN_FRESH` | 0 | 1 = 忽略模型文件，从源码初始权重开始（`-i` 模式同样生效） |
+| 运行 | `TRAIN_SEED` | 0 | 0 = 用当前时间；非 0 = 固定种子，同参数可复现 |
 | 运行 | `VALUE_MODEL_PATH` | `"q_weights.dat"` | 模型读写路径 |
 | 运行 | `TRAINING_TRACE_PATH` | `"training_trace.csv"` | 追踪 CSV；`""` 关闭 |
 | DQN | `DQN_REPLAY_CAPACITY` | 50000 | 回放区容量（注意内存，见 §10） |
 | DQN | `DQN_BATCH_SIZE` | 32 | 每次更新抽多少条 |
-| DQN | `DQN_REPLAY_WARMUP` | 64 | 攒够多少条才开始更新 |
-| DQN | `DQN_TARGET_UPDATE_INTERVAL` | 500 | 每多少次更新同步目标网络 |
+| DQN | `DQN_REPLAY_WARMUP` | 5000 | 攒够多少条才开始更新 |
+| DQN | `DQN_TARGET_UPDATE_INTERVAL` | 800 | 每多少次更新同步目标网络 |
 | DQN | `DQN_GAMMA` | 0.99 | 折扣因子 |
 | DQN | `DQN_LEARNING_RATE` | 0.001 | Adam 的步长（与梯度量级无关） |
 | DQN | `REWARD_SCALE` | 0.01 | 消行分 0/100/300/500/800 乘以它才是训练奖励 |
+| 奖励 | `PENALTY_TOP_OUT` | 10.0 | 顶出一次扣多少奖励 |
+| 奖励 | `PENALTY_HOLE` | 0.005 | 每个洞每步扣多少奖励（`feature[4]`） |
+| 奖励 | `PENALTY_HEIGHT` | 0.001 | 每格堆高每步扣多少奖励（`feature[0]`） |
 | Adam | `ADAM_BETA1` / `ADAM_BETA2` / `ADAM_EPSILON` | 0.9 / 0.999 / 1e-8 | Adam 超参 |
 | Adam | `DQN_LR_DECAY_STEPS` | 0 | 0 = 不衰减；N = 每 N 步学习率减半 |
 | 差分 | `DQN_RHO_RATE` | 0.01 | 基线 ρ 的学习率：`ρ += rate · 批内平均 TD` |
 | 探索 | `TRAIN_EPSILON_START` / `TRAIN_EPSILON_END` | 1 / 0.05 | 每局 ε 从 START 线性到 END |
 
 `START == END` 即固定 ε（如 0.05/0.05，便于可复现实验）；源码默认 1/0.05，即退火。
+
+**所有 DQN/运行宏都带 `#ifndef`**。漏写会怎样：`-D` 被源码里的 `#define` 覆盖回去，
+编译器只丢一句 redefined 警告，扫出来的一整张超参数表全是同一个配置的复制品。
+`sweep_hyperparams.py` 因此把 redefined 当致命错误。
 
 ## 3. 算法
 
@@ -146,14 +154,26 @@ w_i += alpha · (m/c1) / (sqrt(v/c2) + eps);   // c1/c2 为偏差修正
 
 ### 3.6 奖励
 
-**只有消行分**，再乘 `REWARD_SCALE`：
+主体是消行分乘 `REWARD_SCALE`，再减掉三个惩罚项（都是线性的、每步生效）：
+
+```c
+reward = score * REWARD_SCALE
+       - (top_out ? PENALTY_TOP_OUT : 0)     /* 顶出：终局那一步 */
+       - PENALTY_HOLE   * feature[4]         /* 洞数 */
+       - PENALTY_HEIGHT * feature[0]         /* 落点高度 */;
+```
 
 | 一次消行数 | 1 | 2 | 3 | 4 |
 | --- | --- | --- | --- | --- |
 | 棋盘分 | 100 | 300 | 500 | 800 |
 | 训练奖励（scale=0.01） | 1 | 3 | 5 | 8 |
 
-没有存活奖励、也没有顶出惩罚：活着本身不值钱，价值完全来自能消多少行。
+三个惩罚系数默认很小（20 个洞才抵一行），只是给"堆得高、挖得多"一点梯度信号，
+不改变"活着不值钱"这个基调；系数设 0 就回到纯消行分。
+
+⚠️ **奖励 ≠ 棋盘分**：奖励里有惩罚项，所以**测试分数打的是纯棋盘分**（`-i` 模式打印的
+`分数` 是 `place_block` 返回的 0/100/300/500/800 累加），追踪 CSV 的 `score` 列同理。
+拿 `reward/REWARD_SCALE` 反推分数会被惩罚项污染成负数。
 
 ## 4. 特征与偏置
 
@@ -231,8 +251,8 @@ for (turn = 1; ; turn++) {
 | `episode, turn` | 第几局、第几步 |
 | `shape, rotation, x, y` | 这一步的方块与落点 |
 | `epsilon` | 这一步用的 ε |
-| `score` | 这一手消行得到的棋盘分（0/100/300/500/800） |
-| `reward` | 训练奖励（= `score × REWARD_SCALE`） |
+| `score` | 这一手消行得到的棋盘分（0/100/300/500/800，不含惩罚项） |
+| `reward` | 训练奖励（`score × REWARD_SCALE` − 惩罚项） |
 | `terminal` | 是否终局 |
 | `current_value` | `V(s') = b + Σw·φ`（更新前） |
 | `next_value` | `max Q_target(s'', ·)` |
@@ -266,6 +286,7 @@ for (turn = 1; ; turn++) {
 | `correlate_features.py` | 专门看"消行 vs 普通步"：特征比、td×φ 推力、梯度质量占比、Δw2 归因、td 随分位变化 |
 | `plot_value_trajectory.py` | 局内 V 的轨迹（驼峰诊断）：V 沿进度、变化幅度、几局的 V(turn) |
 | `run_experiments.ps1` | 多批次实验：编译 → 训练 → 存模型快照 → 跑测试 → 记分 → 下一批 |
+| `sweep_hyperparams.py` | 超参数扫描：一组参数一个配置，各自从全零权重训练 → 跑测试集 → 出分析图，最后汇一张"参数 vs 测试分"总图 |
 
 ```powershell
 # 单次训练出图
@@ -280,7 +301,23 @@ python .\plot_value_trajectory.py .\training_trace.csv --output .\value_trajecto
 # 多批次实验（20 × 200 局）
 .\run_experiments.ps1 -TrainSet .\1.txt -TestSet .\2.txt -EpisodesPerBatch 200 -BatchCount 20
 python .\analyze_training.py .\runs\trace_batch*.csv --test-log .\runs\test_scores.csv
+
+# 超参数扫描（无参数即跑默认网格；产物在 .\sweep）
+python .\sweep_hyperparams.py --episodes 2000 --seeds 11,22,33
 ```
+
+`sweep_hyperparams.py` 的产物（默认 `.\sweep`）：每个配置一个目录
+（`参数=取值_s种子`，里面是 `trace.csv` / `training.png` / `q_weights.dat` / `result.json`），
+外加 `results.csv`（逐配置明细）、`summary.json`（按参数取值聚合的中位数）和
+`sweep_summary.png`（每个参数一格，纵轴是测试集纯棋盘分，蓝点=中位数、灰点=单次、
+误差条=极差）。
+同一个配置换三个种子是为了压随机噪声——`TRAIN_SEED=0` 时种子取当前时间，
+单次训练之间本来就不可比（见 §10 L10）。
+`--rebuild` 不训练、只用已有 `result.json` 重算表和总图（改画图样式后很有用）；
+`--prune-trace` 出完图删掉 `trace.csv`（每份三十多 MB，一轮扫描 3 GB 以上）。
+想临时换网格不用改代码：`--values DQN_LEARNING_RATE=3e-5,5e-5,1e-4` 替换某个参数的枚举值，
+`--fix DQN_LEARNING_RATE=1e-4 --only DQN_BATCH_SIZE` 把别的参数钉死再扫这一个
+（钉死的配置单独成组、不混进自由扫描的中位数，也不进汇总图）。
 
 `run_experiments.ps1` 的产物（默认 `.\runs`）：`trace_batchNNN.csv`（每批追踪）、
 `model_batchNNN.dat`（测试前快照）、`test_scores.csv`
