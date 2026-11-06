@@ -52,7 +52,7 @@
 #endif
 /* 每次批量更新抽多少条样本 */
 #ifndef DQN_BATCH_SIZE
-#define DQN_BATCH_SIZE 16
+#define DQN_BATCH_SIZE 24
 #endif
 /* 回放区攒满多少条才开始更新 */
 #ifndef DQN_REPLAY_WARMUP
@@ -60,7 +60,7 @@
 #endif
 /* 每多少次批量更新同步一次目标网络 */
 #ifndef DQN_TARGET_UPDATE_INTERVAL
-#define DQN_TARGET_UPDATE_INTERVAL 800
+#define DQN_TARGET_UPDATE_INTERVAL 500
 #endif
 /* 折扣因子 */
 #ifndef DQN_GAMMA
@@ -68,7 +68,7 @@
 #endif
 /* 学习率：Adam 下每一步大约就走这么多，和梯度量级无关（可用 -D 覆盖） */
 #ifndef DQN_LEARNING_RATE
-#define DQN_LEARNING_RATE 0.0003
+#define DQN_LEARNING_RATE 0.0001
 #endif
 /* 奖励缩放：棋盘上的消行分 0/100/300/500/800 乘这个系数才是训练奖励，
    0.01 即奖励变成 0~8，TD 和梯度的量级同步缩小 100 倍。 */
@@ -79,13 +79,13 @@
    顶出一次扣多少、每个洞扣多少、每格堆高扣多少。
    都做成宏是为了能 -D 覆盖：sweep_hyperparams.py 就是靠这个枚举的。 */
 #ifndef PENALTY_TOP_OUT
-#define PENALTY_TOP_OUT 10.0
+#define PENALTY_TOP_OUT 0.0
 #endif
 #ifndef PENALTY_HOLE
-#define PENALTY_HOLE 0.005
+#define PENALTY_HOLE 0.0
 #endif
 #ifndef PENALTY_HEIGHT
-#define PENALTY_HEIGHT 0.001
+#define PENALTY_HEIGHT 0.0
 #endif
 /* Adam 的超参 */
 #ifndef ADAM_BETA1
@@ -113,15 +113,21 @@
 /* ---------- 探索（epsilon 退火） ---------- */
 
 /* 每局训练用的 epsilon 从 START 线性降到 END，END 同时是下限。
-   第 0 局用 START，最后一局正好落在 END 上。run_experiments.ps1 把
-   上一批的 END 当成下一批的 START 传进来，于是 epsilon 跨批首尾相接、
-   整体平滑下降，而不是每批都重新从高处探索一遍。
-   两个值设成一样就是固定 epsilon（现在的默认值），便于做可复现实验。 */
+ * 退火只占前 TRAIN_EPSILON_DECAY_RATIO 这一段（默认 9/10）：
+ * 前面一路线性降到最低，最后 1/10 的局停在 END 上不动，让策略在收尾阶段
+ * 有一整段纯利用的稳定期，而不是到最后一局才刚落到最低探索率。
+ * run_experiments.ps1 把上一批的 END 当成下一批的 START 传进来，于是 epsilon
+ * 跨批首尾相接、整体平滑下降，而不是每批都重新从高处探索一遍。 */
 #ifndef TRAIN_EPSILON_START
 #define TRAIN_EPSILON_START 1
 #endif
 #ifndef TRAIN_EPSILON_END
 #define TRAIN_EPSILON_END 0.05
+#endif
+/* 退火段占总局数的比例：0.9 = 前 90% 的局降到底，最后 10% 保持在 END。
+ * 设成 1.0 就退回到"整段线性、最后一局才落地"的老行为。 */
+#ifndef TRAIN_EPSILON_DECAY_RATIO
+#define TRAIN_EPSILON_DECAY_RATIO 0.8
 #endif
 
 const int block[7][4][4][2] = {
@@ -179,7 +185,7 @@ const int block[7][4][4][2] = {
 };
 int board[25][15]={0};
 enum { FEATURE_COUNT = 6 };
-double value_weights[FEATURE_COUNT] = {-45.0, 34.0, -32.0, -93.0, -79.0, -34.0};
+double value_weights[FEATURE_COUNT] = {-45.0,34.0,-32.0,-93.0,-79.0,-34.0};
 /* 常数偏置：Q = w·φ + b。没有它，整体几百上千的偏移只能靠特征硬凑。 */
 double value_bias = 0.0;
 
@@ -223,7 +229,7 @@ int can_place(int shape,int rotation,int x,int y);
 
 static void reset_value_model(void){
     const double initial_weights[FEATURE_COUNT]=
-        {-45.0,34.0,-32.0,-93.0,-79.0,-34.0};
+        {0,0,0,0,0,0};
     memcpy(value_weights,initial_weights,sizeof(value_weights));
     value_bias=0.0;
     reset_adam_state();
@@ -916,12 +922,17 @@ static int train_value_model(int episodes,const char *input_path,
             wraps++;
         }
 
-        /* 第 0 局用 START、最后一局正好用 END：上一批的 END 就是
-           下一批的 START，多批次实验里 epsilon 连成一条直线。 */
+        /* 前 TRAIN_EPSILON_DECAY_RATIO（默认 9/10）的局线性降到 END，
+           剩下 1/10 的局钳在 END 上：收尾有一段纯利用的稳定期。
+           上一批的 END 就是下一批的 START，多批次实验里 epsilon 仍首尾相接。 */
         double epsilon=TRAIN_EPSILON_START;
-        if(episodes>1)
-            epsilon+=(TRAIN_EPSILON_END-TRAIN_EPSILON_START)*
-                     (double)episode/(double)(episodes-1);
+        if(episodes>1){
+            double decay_episodes=(double)(episodes-1)*TRAIN_EPSILON_DECAY_RATIO;
+            if(decay_episodes<1.0)decay_episodes=1.0;
+            double progress=(double)episode/decay_episodes;
+            if(progress>1.0)progress=1.0;
+            epsilon+=(TRAIN_EPSILON_END-TRAIN_EPSILON_START)*progress;
+        }
         if(epsilon<TRAIN_EPSILON_END)epsilon=TRAIN_EPSILON_END;
 
         int has_training_data=0;
